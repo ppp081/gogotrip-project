@@ -1,22 +1,4 @@
-gcloud builds submit \
-  --tag gcr.io/gogotrip-senior-project/tripbot
-
-
-gcloud run services update tripbot \
-  --region asia-southeast1 \
-  --update-env-vars \
-FRONTEND_URL="http://localhost:5173,https://tripbot-frontend-294086862024.asia-southeast1.run.app"
-
-
-
-
-
-โอเค จัดให้แบบ **สั้นมาก ใช้บน macOS เท่านั้น** 👇
-
----
-
-
-# App Backend (Django) – macOS
+# App Backend (Django) – ENV macOS 
 
 ## 1. สร้างและ activate virtual environment
 
