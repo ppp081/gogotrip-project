@@ -8,28 +8,34 @@ gcloud run services update tripbot \
 FRONTEND_URL="http://localhost:5173,https://tripbot-frontend-294086862024.asia-southeast1.run.app"
 
 
-1. Backend (app-backend)
-The backend is a Django application.
 
-Navigate to the backend directory:
 
-bash
-cd /Users/punch/project/app-frontend/final/app-backend
-Create and activate a virtual environment (Recommended):
 
-bash
+โอเค จัดให้แบบ **สั้นมาก ใช้บน macOS เท่านั้น** 👇
+
+---
+
+
+# App Backend (Django) – macOS
+
+## 1. สร้างและ activate virtual environment
+
 python3 -m venv venv
-source venv/bin/activate 
-Install dependencies:
+source venv/bin/activate
 
-bash
+## 2. ติดตั้ง dependencies
+
+
 pip install -r requirements.txt
-Run database migrations:
 
-bash
+## 3. migrate database
+
+
 python manage.py migrate
-Start the server:
 
-bash
+## 4. run server
+
+
 python manage.py runserver
-The backend will run at http://127.0.0.1:8000.
+ngrok http 8000
+https://cc56-2403-6200-88a7-1016-7098-35d9-1307-601d.ngrok-free.app
