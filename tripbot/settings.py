@@ -22,6 +22,28 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 LINE_CHANNEL_NGROK_BASE = os.getenv("LINE_CHANNEL_NGROK_BASE", "")
 
+# SlipOK — ตรวจสลิปโอนเงิน (https://slipok.com)
+# URL: POST https://api.slipok.com/api/line/apikey/<BRANCH_ID>  header x-authorization: <API_KEY>
+SLIPOK_API_KEY = os.getenv("SLIPOK_API_KEY")
+SLIPOK_BRANCH_ID = os.getenv("SLIPOK_BRANCH_ID") or os.getenv("SLIPOK_SECRET_KEY")
+SLIPOK_LOG = os.getenv("SLIPOK_LOG", "true").lower() in ("1", "true", "yes")
+SLIPOK_BANK_CODE = os.getenv("SLIPOK_BANK_CODE")
+SLIPOK_BANK_NAME = os.getenv("SLIPOK_BANK_NAME")
+SLIPOK_BANK_NAME_TH = os.getenv("SLIPOK_BANK_NAME_TH")
+SLIPOK_BANK_ACCOUNT_NUMBER = os.getenv("SLIPOK_BANK_ACCOUNT_NUMBER")
+# ข้อความแสดงลูกค้าตอนโอน PromptPay (LINE)
+SLIPOK_PROMPTPAY_NUMBER = os.getenv("SLIPOK_PROMPTPAY_NUMBER")
+SLIPOK_BANK_ACCOUNT_OWNER = os.getenv("SLIPOK_BANK_ACCOUNT_OWNER")
+PROMPTPAY_QR_IMAGE_URL = os.getenv(
+    "PROMPTPAY_QR_IMAGE_URL",
+    "https://fcnuamycwiqdgcrwlcba.supabase.co/storage/v1/object/public/app-object-storage/payment/promptpay.png",
+)
+
+# Supabase Storage — อัปโหลดสลิปหลัง SlipOK ผ่าน
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_OBJECT_STORAGE = os.getenv("SUPABASE_OBJECT_STORAGE", "app-object-storage")
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -65,6 +87,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -72,8 +95,6 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    'corsheaders.middleware.CorsMiddleware',
-    
 ]
 
 
@@ -159,5 +180,25 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-# CORS settings
-CORS_ALLOW_ALL_ORIGINS = True
+
+# Django REST Framework — session cookie สำหรับแดชบอร์ด admin
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+    ],
+}
+
+# CORS — ต้องระบุ origin แบบชัดเจนเมื่อใช้ credentials (cookie session)
+_cors_origins = os.getenv(
+    "CORS_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173",
+)
+CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins.split(",") if o.strip()]
+CORS_ALLOW_CREDENTIALS = True
+
+# เก่า: CORS_ALLOW_ALL_ORIGINS = True — ปิดเมื่อใช้ credentials
+CORS_ALLOW_ALL_ORIGINS = False
+
+CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS.copy()
+SESSION_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_HTTPONLY = True

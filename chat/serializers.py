@@ -16,6 +16,8 @@ from .models import (
     Admin,
     Image,
     BookingEquipment,
+    Rating,
+    Summary,
 )
 
 class LineUserSerializer(serializers.ModelSerializer):
@@ -95,20 +97,12 @@ class ChatbotSessionSerializer(serializers.ModelSerializer):
 
 
 class ImageSerializer(serializers.ModelSerializer):
-    image_base64 = serializers.SerializerMethodField()
-
     class Meta:
         model = Image
         fields = [
             'id', 'trip', 'image_url', 'image_type',
-            'image_thumbnail', 'created_at', 'image_base64'
+            'image_thumbnail', 'created_at'
         ]
-
-    def get_image_base64(self, obj):
-        if obj.image_data:
-            base64_str = base64.b64encode(obj.image_data).decode('utf-8')
-            return f"data:image/jpeg;base64,{base64_str}"
-        return None
 
 
 class TripSerializer(serializers.ModelSerializer):
@@ -128,11 +122,10 @@ class TripSerializer(serializers.ModelSerializer):
         ]
 
     def get_thumbnail_image(self, obj):
-        request = self.context["request"]
         thumbnail = obj.images.filter(image_thumbnail=True).first()
         if not thumbnail:
             return None
-        return request.build_absolute_uri(f"/api/images/{thumbnail.id}/file/")
+        return thumbnail.image_url
 
 
 
@@ -172,3 +165,33 @@ class BookingEquipmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = BookingEquipment
         fields = ['id', 'booking', 'equipment', 'equipment_name', 'quantity', 'total_price']
+
+class RatingSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.name', read_only=True)
+    
+    class Meta:
+        model = Rating
+        fields = [
+            'id', 'trip', 'user', 'user_name', 'booking_id',
+            'trip_rating', 'service_rating', 'comment', 'created_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'user_name']
+
+
+class SummarySerializer(serializers.ModelSerializer):
+    sentiment = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Summary
+        fields = [
+            'id', 'total_reviews', 'average_rating',
+            'sentiment', 'issues', 'suggestion', 'faqs', 'created_at',
+        ]
+        read_only_fields = fields
+
+    def get_sentiment(self, obj):
+        return {
+            "positive": {"count": obj.positive_count, "percentage": obj.positive_percentage},
+            "neutral": {"count": obj.neutral_count, "percentage": obj.neutral_percentage},
+            "negative": {"count": obj.negative_count, "percentage": obj.negative_percentage},
+        }

@@ -162,3 +162,5 @@ cython_debug/
 # macOS
 .DS_Store
 
+# sql_script
+sql_script/

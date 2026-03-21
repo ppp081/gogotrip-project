@@ -28,13 +28,30 @@ from linebot.models import (
 
 # LLM Calling
 from .agent import *
-from .models import LineUser, LineMessage, User, Rating, Trip, Booking
+from .models import LineUser, LineMessage, User, Rating, Trip, Booking, Equipment
+from .slipok import verify_slip_image_bytes, slipok_is_configured
 from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain.schema import HumanMessage, AIMessage, BaseMessage
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
 
 logger = logging.getLogger(__name__)
+
+
+def _format_line_outgoing_for_debug(messages) -> str:
+    """Human-readable debug dump for outbound LINE messages (Thai prints as Thai, not \\uXXXX)."""
+    if not messages:
+        return "(ว่าง)"
+    lines: list[str] = []
+    for i, m in enumerate(messages):
+        if isinstance(m, TextSendMessage):
+            lines.append(f"[{i}] ข้อความ:\n{m.text}")
+        elif isinstance(m, FlexSendMessage):
+            alt = getattr(m, "alt_text", "") or ""
+            lines.append(f"[{i}] Flex (alt): {alt}")
+        else:
+            lines.append(f"[{i}] {type(m).__name__}")
+    return "\n".join(lines)
+
 
 # LINE Bot API setup
 line_bot_api = LineBotApi(settings.LINE_CHANNEL_ACCESS_TOKEN)
@@ -219,7 +236,8 @@ def handle_text_message(event):
 
         # กำลังจอง
         if user_status == "pending_payment":
-            if incoming_message.content == "ยกเลิก":
+            content_trim = (incoming_message.content or "").strip()
+            if content_trim == "ยกเลิก":
                 line_user.user_status = "idle"
                 line_user.user_metadata = {}
                 line_user.save(update_fields=["user_status", "user_metadata"])
@@ -228,16 +246,53 @@ def handle_text_message(event):
                     "หากต้องการจองทริปใหม่ หรือต้องการสอบถามข้อมูลเพิ่มเติม "
                     "สามารถพิมพ์ข้อความเข้ามาได้เลยครับ 🌿"
                 )
+            elif content_trim == "ชำระเงิน":
+                reply_text = build_pending_payment_detail_text(line_user)
             else:
                 reply_text = (
                     "🔔 ขณะนี้คุณกำลังอยู่ในขั้นตอนการชำระเงินครับ\n"
                     "หากต้องการอัปโหลดสลิปใหม่ สามารถส่งรูปเข้ามาได้เลย\n\n"
-                    "หากต้องการยกเลิก หรือเริ่มจองทริปใหม่ พิมพ์คำว่า “ยกเลิก” ได้เลยครับ 🌿"
+                    "หากต้องการยกเลิก หรือเริ่มจองทริปใหม่ พิมพ์คำว่า “ยกเลิก” ได้เลยครับ 🌿\n\n"
+                    "หากต้องการดูรายละเอียดการชำระเงิน (ยอดรวม ข้อมูลจอง) "
+                    "พิมพ์คำว่า \"ชำระเงิน\" ระบบจะส่งรายละเอียดให้อัตโนมัติครับ 💬"
                 )
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=reply_text)
-            )
+
+            if content_trim == "ชำระเงิน":
+                qr = _promptpay_qr_url()
+                outbound = [TextSendMessage(text=reply_text), ImageSendMessage(original_content_url=qr, preview_image_url=qr)]
+                line_bot_api.reply_message(event.reply_token, outbound)
+                LineMessage.objects.create(
+                    line_user=line_user,
+                    message_id=f"reply_{incoming_message.id}",
+                    message_type=LineMessage.MessageType.TEXT,
+                    direction=LineMessage.Direction.OUTGOING,
+                    content=reply_text,
+                    timestamp=tz.now(),
+                    processed=True,
+                )
+                LineMessage.objects.create(
+                    line_user=line_user,
+                    message_id=f"reply_{incoming_message.id}_promptpay_qr",
+                    message_type=LineMessage.MessageType.IMAGE,
+                    direction=LineMessage.Direction.OUTGOING,
+                    content=qr,
+                    timestamp=tz.now(),
+                    processed=True,
+                )
+            else:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text=reply_text),
+                )
+                LineMessage.objects.create(
+                    line_user=line_user,
+                    message_id=f"reply_{incoming_message.id}",
+                    message_type=LineMessage.MessageType.TEXT,
+                    direction=LineMessage.Direction.OUTGOING,
+                    content=reply_text,
+                    timestamp=tz.now(),
+                    processed=True,
+                )
             return
         else:
             if incoming_message.content == "เริ่มการติดต่อเจ้าหน้าที่และสนทนา":
@@ -257,7 +312,7 @@ def handle_text_message(event):
             else:
                 # Get Message History
                 try:
-                    history = get_chat_history(line_user, limit=5)
+                    history = get_chat_history(line_user, limit=6)
                     result  = run_agent(incoming_message.content, history, line_user)
 
                 except Exception as ai_error:
@@ -291,7 +346,7 @@ def handle_text_message(event):
                 # Text Message
                 if response_content and response_content.strip():
                     messages.append(TextSendMessage(text=response_content))
-                    print(f"[DEBUG]: reponse content\n{messages}\n")
+                    print(f"[DEBUG] ข้อความที่จะส่ง ({len(messages)} ข้อความ):\n{_format_line_outgoing_for_debug(messages)}\n")
 
                 # FallBack Message
                 if not messages:
@@ -338,24 +393,69 @@ def handle_image_message(event):
 
         # ---------- Core Behavior ----------
         if user_status == "pending_payment":
-            image = imageBase64(event)
-            agent_response = payment_verify_agent(user_id=user_id, user_slip_b64=image)
-            print(f"[DEBUG]: {agent_response}")
+            b64 = imageBase64(event)
+            if not b64:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="ไม่สามารถดึงรูปสลิปได้ครับ กรุณาส่งรูปใหม่อีกครั้ง 🙏"),
+                )
+                return
 
-            if "confirm" in agent_response:
+            try:
+                raw_bytes = base64.b64decode(b64)
+            except Exception:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="ไฟล์รูปไม่ถูกต้อง กรุณาส่งสลิปเป็น JPG/PNG ชัด ๆ อีกครั้งครับ"),
+                )
+                return
+
+            # --- เดิม: ใช้ AI ตรวจสลิป (payment_verify_agent) — เก็บไว้อ้างอิง ---
+            # agent_response = payment_verify_agent(user_id=user_id, user_slip_b64=image)
+            # if "confirm" in agent_response: ...
+
+            if not slipok_is_configured():
+                logger.error("SlipOK missing SLIPOK_API_KEY or SLIPOK_BRANCH_ID/SLIPOK_SECRET_KEY")
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(
+                        text="ระบบตรวจสลิปยังไม่พร้อม (ตั้งค่า SlipOK ไม่ครบ) รบกวนติดต่อทีมงานชั่วคราวครับ 🙏"
+                    ),
+                )
+                return
+
+            bd = _pending_payment_breakdown(line_user)
+            expected_total = bd["grand_total"] if bd else None
+            slip_res = verify_slip_image_bytes(
+                raw_bytes, expected_amount_baht=expected_total
+            )
+            logger.info(
+                "SlipOK result ok=%s http=%s code=%s msg=%s slip_amt=%s",
+                slip_res.ok,
+                slip_res.http_status,
+                slip_res.api_code,
+                slip_res.message[:120] if slip_res.message else "",
+                slip_res.slip_amount,
+            )
+
+            if slip_res.ok:
                 meta = line_user.user_metadata or {}
-                booking, payment, confirm_meta = create_booking_and_payment(line_user, meta)
+                booking, payment, confirm_meta = create_booking_and_payment(
+                    line_user,
+                    meta,
+                    slip_ok_payload=slip_res.payload,
+                    slip_image_bytes=raw_bytes,
+                )
                 flex_payload = booking_confirm_flex(confirm_meta)
-
                 line_bot_api.reply_message(
                     event.reply_token,
                     [
                         FlexSendMessage(
                             alt_text="Booking Confirmed",
-                            contents=flex_payload
+                            contents=flex_payload,
                         ),
                         TextSendMessage(
-                            text=( 
+                            text=(
                                 "🎉 ยืนยันการชำระเงินเรียบร้อยครับ!\n\n"
                                 f"• ทริป: {confirm_meta['trip_name']}\n"
                                 f"• จังหวัด: {confirm_meta['trip_province']}\n"
@@ -366,30 +466,27 @@ def handle_image_message(event):
                                 "ขอบคุณที่เลือกเดินทางกับเรา #GoGoTrip 🌿\n"
                                 "ขอให้คุณมีทริปที่เต็มไปด้วยรอยยิ้มและความทรงจำดี ๆ ครับ 😊"
                             )
-                        )
-                    ]
+                        ),
+                    ],
                 )
-
-                # ✅ reset user state & metadata
                 line_user.user_status = "idle"
                 line_user.user_metadata = {}
                 line_user.save(update_fields=["user_status", "user_metadata"])
-
-            elif "reject" in agent_response:
-                # line_user.user_status = "idle"
-                # line_user.user_metadata = {}
-                # line_user.save(update_fields=["user_status", "user_metadata"])
-
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text="❌ ระบบไม่สามารถยืนยันสลิปได้ กรุณาส่งสลิปใหม่อีกครั้งครับ")
-                )
-
             else:
+                extra = ""
+                if slip_res.api_code == 1013 and expected_total is not None and slip_res.slip_amount is not None:
+                    extra = (
+                        f"\n\nยอดที่ต้องชำระ: {int(expected_total):,} บาท\n"
+                        f"ยอดบนสลิป: {int(slip_res.slip_amount):,} บาท"
+                    )
+                elif slip_res.api_code == 1010:
+                    extra = "\n\nลองส่งสลิปใหม่อีกครั้งหลังเวลาที่แนะนำครับ"
+                reply_text = f"❌ {slip_res.message}{extra}\n\nกรุณาตรวจสอบและส่งสลิปใหม่อีกครั้งครับ 🙏"
                 line_bot_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(text="⚠️ ตรวจไม่พบข้อมูลการโอน กรุณาส่งสลิปใหม่อีกครั้งครับ")
+                    TextSendMessage(text=reply_text),
                 )
+            return
 
     except Exception as e:
         logger.exception("Error in handle_image_message: %s", e)
@@ -539,21 +636,23 @@ def handle_postback(event):
         line_user.user_status = "pending_payment"
         line_user.save(update_fields=["user_metadata", "user_status"])
 
-        # ข้อความส่งไป LINE (ไม่ต้องแปะ JSON อีก)
-        response_content = (
-            f"ขอบคุณครับ! ยืนยันการจองทริปเรียบร้อยแล้ว 🎉\n\n"
-            f"🧭 รหัสทริป: {trip_id}\n"
-            f"👥 จำนวนผู้เดินทาง: {count} คน\n"
-            f"🎒 อุปกรณ์เพิ่มเติม: {len(booking_equipment)} รายการ\n\n"
-            "กรุณาชำระเงินตามรายละเอียดด้านล่าง แล้วส่งสลิปกลับมาครับ 💬"
-        )
+        bd = _pending_payment_breakdown(line_user)
+        response_parts = [
+            "ขอบคุณครับ! ยืนยันการจองทริปเรียบร้อยแล้ว 🎉",
+            "",
+            f"🧭 รหัสทริป: {trip_id}",
+            f"👥 จำนวนผู้เดินทาง: {count} คน",
+            f"🎒 อุปกรณ์เพิ่มเติม: {len(booking_equipment)} รายการ",
+        ]
+        if bd:
+            response_parts.extend(["", f"💰 ยอดที่ต้องชำระ: {int(bd['grand_total']):,} บาท"])
+        response_parts.extend(["", *_promptpay_instruction_lines()])
+        response_content = "\n".join(response_parts)
 
+        qr_url = _promptpay_qr_url()
         messages = [
             TextSendMessage(text=response_content),
-            ImageSendMessage(
-                original_content_url="https://www.octopus.com.hk/en/consumer/customer-service/faq/promptpay/images/promptpay_qr_screen.png",
-                preview_image_url="https://www.octopus.com.hk/en/consumer/customer-service/faq/promptpay/images/promptpay_qr_screen.png"
-            )
+            ImageSendMessage(original_content_url=qr_url, preview_image_url=qr_url),
         ]
 
         line_bot_api.reply_message(event.reply_token, messages)
@@ -1302,8 +1401,211 @@ def get_meta(content: str):
     return None
 
 
-def create_booking_and_payment(line_user, meta):
-    """สร้าง Booking + Payment จากข้อมูล meta และแนบข้อมูลทริปกลับ"""
+def _promptpay_qr_url() -> str:
+    u = getattr(settings, "PROMPTPAY_QR_IMAGE_URL", None)
+    if u and str(u).strip():
+        return str(u).strip()
+    return (
+        "https://fcnuamycwiqdgcrwlcba.supabase.co/storage/v1/object/public/"
+        "app-object-storage/payment/promptpay.png"
+    )
+
+
+def _promptpay_transfer_lines() -> list[str]:
+    """รายละเอียด PromptPay สำหรับข้อความลูกค้า (อิงค่าใน settings / .env)"""
+    bank = (getattr(settings, "SLIPOK_BANK_NAME_TH", None) or "").strip()
+    pp = (getattr(settings, "SLIPOK_PROMPTPAY_NUMBER", None) or "").strip()
+    owner = (getattr(settings, "SLIPOK_BANK_ACCOUNT_OWNER", None) or "").strip()
+    lines: list[str] = [
+        "📲 ชำระเงินผ่าน PromptPay",
+        "",
+    ]
+    if bank:
+        lines.append(f"🏦 ธนาคาร: {bank}")
+    if owner:
+        lines.append(f"👤 ชื่อบัญชี / ผู้รับเงิน: {owner}")
+    if pp:
+        lines.append(f"📱 เลข PromptPay: {pp}")
+    if not (bank or owner or pp):
+        lines.append("ดูเลข PromptPay ได้จาก QR ในภาพที่ทีมส่งให้ครับ")
+    lines.extend(
+        [
+            "",
+            "สแกน QR ในภาพถัดไป หรือโอนผ่านเลข PromptPay ด้านบนให้ตรงยอดที่แจ้ง",
+            "เมื่อโอนแล้ว ส่งสลิปเป็นรูปภาพกลับมาที่แชทนี้เพื่อยืนยันได้เลยครับ 🙏",
+        ]
+    )
+    return lines
+
+
+def _promptpay_instruction_lines() -> list[str]:
+    """รวมเส้นคั่น + รายละเอียด PromptPay (หลังสรุปยอดจอง)"""
+    return ["──────────────", *_promptpay_transfer_lines()]
+
+
+def _pending_payment_breakdown(line_user) -> dict | None:
+    """ข้อมูลยอดและทริปจาก user_metadata ระหว่างรอชำระเงิน — ใช้ทั้งข้อความแจ้งยอดและ SlipOK"""
+    meta = line_user.user_metadata or {}
+    trip_id = meta.get("trip_id")
+    if not trip_id:
+        return None
+    try:
+        trip = Trip.objects.get(id=trip_id)
+    except Trip.DoesNotExist:
+        return None
+
+    person_count = int(meta.get("booking_person_count") or 1)
+    base = Decimal(str(trip.price_per_person))
+    trip_subtotal = base * person_count
+
+    equip_lines: list[str] = []
+    equip_total = Decimal("0")
+    for eq in meta.get("booking_equipment") or []:
+        qty = int(eq.get("qty") or 0)
+        if qty <= 0:
+            continue
+        eid = eq.get("equipment_id")
+        if not eid:
+            continue
+        try:
+            equipment = Equipment.objects.get(id=eid)
+        except Equipment.DoesNotExist:
+            logger.warning("Pending payment detail: equipment id=%s missing", eid)
+            continue
+        line_total = equipment.price * qty
+        equip_total += line_total
+        equip_lines.append(f"  • {equipment.name} × {qty} = {int(line_total):,} บาท")
+
+    grand_total = trip_subtotal + equip_total
+
+    start, end = trip.start_date, trip.end_date
+    if start.month == end.month and start.year == end.year:
+        trip_date = f"{start.day} - {end.day} {formats.date_format(end, 'F Y', use_l10n=True)}"
+    else:
+        trip_date = (
+            f"{formats.date_format(start, 'j F Y', use_l10n=True)} - "
+            f"{formats.date_format(end, 'j F Y', use_l10n=True)}"
+        )
+
+    return {
+        "trip": trip,
+        "meta": meta,
+        "person_count": person_count,
+        "base": base,
+        "trip_subtotal": trip_subtotal,
+        "equip_lines": equip_lines,
+        "equip_total": equip_total,
+        "grand_total": grand_total,
+        "trip_date": trip_date,
+        "cust_name": meta.get("customer_name") or "-",
+        "cust_phone": meta.get("customer_phone") or "-",
+        "cust_email": meta.get("customer_email") or "-",
+    }
+
+
+def build_pending_payment_detail_text(line_user) -> str:
+    """
+    สรุปยอดและรายละเอียดการจองจาก user_metadata ขณะรอชำระเงิน
+    (ให้ลูกค้าพิมพ์ "ชำระเงิน" เพื่อดูซ้ำได้)
+    """
+    meta = line_user.user_metadata or {}
+    if not meta.get("trip_id"):
+        return (
+            "ยังไม่พบข้อมูลการจองค้างชำระในระบบครับ\n"
+            "หากชำระไปแล้วหรือมีข้อสงสัย รบกวนติดต่อทีมงานครับ 🙏"
+        )
+    d = _pending_payment_breakdown(line_user)
+    if d is None:
+        return "ไม่พบข้อมูลทริปครับ กรุณาติดต่อทีมงานครับ"
+
+    trip = d["trip"]
+    person_count = d["person_count"]
+    base = d["base"]
+    trip_subtotal = d["trip_subtotal"]
+    equip_lines = d["equip_lines"]
+    equip_total = d["equip_total"]
+    grand_total = d["grand_total"]
+    trip_date = d["trip_date"]
+    cust_name = d["cust_name"]
+    cust_phone = d["cust_phone"]
+    cust_email = d["cust_email"]
+
+    lines: list[str] = [
+        "💰 รายละเอียดการชำระเงิน (คำสั่งจองของคุณ)",
+        "",
+        f"📌 ทริป: {trip.name}",
+        f"📍 จังหวัด: {trip.province}",
+        f"📅 วันเดินทาง: {trip_date}",
+        f"👥 จำนวนผู้เดินทาง: {person_count} คน",
+        f"💵 ราคาทริปต่อคน: {int(base):,} บาท",
+        f"➡️ ค่าทริปรวม: {int(trip_subtotal):,} บาท",
+    ]
+    if equip_lines:
+        lines.append("🎒 อุปกรณ์เสริม:")
+        lines.extend(equip_lines)
+        lines.append(f"➡️ รวมอุปกรณ์: {int(equip_total):,} บาท")
+    lines.extend(
+        [
+            "──────────────",
+            f"✅ ยอดที่ต้องชำระทั้งหมด: {int(grand_total):,} บาท",
+            "",
+            "👤 ผู้จอง:",
+            f"  • ชื่อ: {cust_name}",
+            f"  • โทร: {cust_phone}",
+            f"  • อีเมล: {cust_email}",
+            "",
+            "──────────────",
+        ]
+    )
+    lines.extend(_promptpay_transfer_lines())
+    return "\n".join(lines)
+
+
+def _slip_payload_payment_fields(slip_payload: dict | None) -> dict:
+    """ดึงฟิลด์สำหรับ Payment จาก body SlipOK (data.sender/receiver/amount/transRef ฯลฯ)"""
+    if not slip_payload or not isinstance(slip_payload, dict):
+        return {}
+    data = slip_payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+    recv = data.get("receiver") if isinstance(data.get("receiver"), dict) else {}
+    recv_acct = recv.get("account") if isinstance(recv.get("account"), dict) else {}
+    send = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+    send_acct = send.get("account") if isinstance(send.get("account"), dict) else {}
+    detail = {
+        "transRef": data.get("transRef"),
+        "amount": data.get("amount"),
+        "paidLocalAmount": data.get("paidLocalAmount"),
+        "transDate": data.get("transDate"),
+        "transTime": data.get("transTime"),
+        "receivingBank": data.get("receivingBank"),
+        "sendingBank": data.get("sendingBank"),
+        "receiver_displayName": recv.get("displayName"),
+        "receiver_account": recv_acct.get("value"),
+        "sender_displayName": send.get("displayName"),
+        "sender_account": send_acct.get("value"),
+        "language": data.get("language"),
+        "slip_message": data.get("message"),
+    }
+    tx = str(data.get("transRef") or "")[:100]
+    recv_val = recv_acct.get("value") or ""
+    return {
+        "transaction_id": tx,
+        "bank_account": str(recv_val)[:255],
+        "verification_notes": json.dumps(detail, ensure_ascii=False),
+    }
+
+
+def create_booking_and_payment(
+    line_user,
+    meta,
+    *,
+    slip_ok_payload: dict | None = None,
+    slip_image_bytes: bytes | None = None,
+):
+    """สร้าง Booking + Payment จากข้อมูล meta และแนบข้อมูลทริปกลับ
+    slip_ok_payload / slip_image_bytes — จาก SlipOK เมื่อยืนยันสลิปแล้ว (อัปโหลดสลิปไป Supabase)
+    """
 
     print(f"[DEBUG] Booking&Payment: {meta}")
     trip = Trip.objects.get(id=meta["trip_id"])
@@ -1364,14 +1666,35 @@ def create_booking_and_payment(line_user, meta):
     booking.total_price = trip_total_price + total_equipment_price
     booking.save(update_fields=["total_price"])
 
-    # สร้าง Payment record
+    # สร้าง Payment record (+ รายละเอียดจากสลิป SlipOK ถ้ามี)
+    slip_extra: dict = {}
+    slip_now = None
+    if slip_ok_payload:
+        slip_extra = _slip_payload_payment_fields(slip_ok_payload)
+        slip_now = tz.now()
+
     payment = Payment.objects.create(
         booking=booking,
         amount=booking.total_price,
         payment_method=Payment.Method.BANK_TRANSFER,
         payment_status=Payment.Status.PAID,
         paid_at=tz.now(),
+        transaction_id=slip_extra.get("transaction_id", ""),
+        bank_account=slip_extra.get("bank_account", ""),
+        verification_notes=slip_extra.get("verification_notes", ""),
+        slip_uploaded_at=slip_now,
+        verified_at=slip_now,
     )
+
+    if slip_image_bytes:
+        from .supabase_storage import upload_payment_slip
+
+        pub, storage_path = upload_payment_slip(slip_image_bytes, payment.id)
+        if pub:
+            payment.slip_public_url = pub
+            payment.slip_storage_path = storage_path or ""
+            payment.save(update_fields=["slip_public_url", "slip_storage_path"])
+            logger.info("Payment slip uploaded | payment=%s path=%s", payment.id, storage_path)
 
     # คำนวณวัน เวลา และระยะเวลา (เวอร์ชันไทย)
     start = trip.start_date
@@ -1415,8 +1738,15 @@ def create_booking_and_payment(line_user, meta):
 
 
 
-def get_chat_history(line_user, limit=5) -> list[BaseMessage]:
-    """ดึงประวัติการสนทนาล่าสุดของ user ในรูปแบบ list[BaseMessage]"""
+def _strip_outbound_meta_json(content: str) -> str:
+    """เลื่อนเฉพาะข้อความที่ผู้ใช้อ่าน — ตัดบล็อก [__META_JSON__] ที่แนบตอนบันทึก trip_list / booking meta"""
+    if not content or "[__META_JSON__]" not in content:
+        return (content or "").strip()
+    return content.split("[__META_JSON__]", 1)[0].strip()
+
+
+def get_chat_history(line_user, limit=24) -> list[BaseMessage]:
+    """ดึงประวัติการสนทนาล่าสุดของ user ในรูปแบบ list[BaseMessage] (ล่าสุด = ท้ายรายการ)"""
     messages = (
         LineMessage.objects.filter(line_user=line_user)
         .order_by("-timestamp")[:limit]
@@ -1426,9 +1756,9 @@ def get_chat_history(line_user, limit=5) -> list[BaseMessage]:
     history_messages: list[BaseMessage] = []
     for m in messages:
         if m.direction == LineMessage.Direction.INCOMING:
-            history_messages.append(HumanMessage(content=m.content))
+            history_messages.append(HumanMessage(content=(m.content or "").strip()))
         else:
-            history_messages.append(AIMessage(content=m.content))
+            history_messages.append(AIMessage(content=_strip_outbound_meta_json(m.content or "")))
 
     return history_messages
 
@@ -1476,4 +1806,3 @@ def send_post_trip_feedback(line_user_id: str, trip_id: str, trip_name: str, boo
     except Exception as e:
         logger.error(f"Failed to send feedback to {line_user_id}: {e}")
         return False
-

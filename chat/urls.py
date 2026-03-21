@@ -3,6 +3,7 @@ Chat app URLs for API endpoints
 """
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
+from .auth_views import api_login, api_logout, api_me, api_csrf
 from .api_views import (
     LineUserViewSet,
     LineMessageViewSet,
@@ -15,7 +16,8 @@ from .api_views import (
     EquipmentViewSet,
     BookingEquipmentViewSet,
     ImageViewSet,
-    
+    RatingViewSet,
+    SummaryViewSet,
 )
 
 # Create router and register viewsets
@@ -31,8 +33,13 @@ router.register(r'payments', PaymentViewSet)
 router.register(r'equipments', EquipmentViewSet)
 router.register(r'booking-equipments', BookingEquipmentViewSet)
 router.register(r'images', ImageViewSet)
-
+router.register(r'ratings', RatingViewSet)
+router.register(r'summaries', SummaryViewSet)
 
 urlpatterns = [
+    path('auth/login/', api_login),
+    path('auth/logout/', api_logout),
+    path('auth/me/', api_me),
+    path('auth/csrf/', api_csrf),
     path('', include(router.urls)),
 ]

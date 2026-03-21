@@ -103,20 +103,33 @@ def get_trips(
             "response_meta": {}
         }
 
+    _trip_img_placeholder = (
+        "https://www.shutterstock.com/image-vector/remote-work-black-white-error-260nw-2352059897.jpg"
+    )
+
+    def _trip_cover_url(trip) -> str:
+        thumb = trip.images.filter(image_thumbnail=True).first()
+        if thumb:
+            url = (thumb.image_url or "").strip()
+            if url:
+                return url
+            return f"{LINE_CHANNEL_NGROK_BASE}/api/images/{thumb.id}/file/"
+        for img in trip.images.all().order_by("created_at"):
+            url = (img.image_url or "").strip()
+            if url:
+                return url
+        return _trip_img_placeholder
+
     trips_data = []
     for t in qs.order_by("start_date")[:limit]:
+        img_url = _trip_cover_url(t)
 
-        thumbnail = t.images.filter(image_thumbnail=True).first()
-        img_url = f"{LINE_CHANNEL_NGROK_BASE}/api/images/{thumbnail.id}/file/" if thumbnail else "https://www.shutterstock.com/image-vector/remote-work-black-white-error-260nw-2352059897.jpg"
-        # print(img_url)
-        
         trips_data.append({
             "trip_id": str(t.id),
             "trip_name": t.name,
             "trip_province": t.province,
             "trip_description": t.description,
             "trip_price_per_person": f"{int(t.price_per_person):,}",
-            "trip_date": f"{t.start_date.strftime('%d %B')} - {t.end_date.strftime('%d %B')}",
             "trip_date": f"{t.start_date.strftime('%d')} {THAI_MONTHS[t.start_date.strftime('%B')]} - {t.end_date.strftime('%d')} {THAI_MONTHS[t.end_date.strftime('%B')]}",
             "trip_time": f"{t.start_date.strftime('%H:%M')} - {t.end_date.strftime('%H:%M')}",
             "trip_image_url": img_url,
@@ -205,3 +218,33 @@ def get_payments(status: Optional[str] = "") -> str:
             f"method={p.payment_method}"
         )
     return "\n".join(rows) if rows else "ไม่พบการชำระเงิน"
+
+
+# ----------- My Trips Tool -----------
+@tool("get_my_trips")
+def get_my_trips(line_user_id: str) -> str:
+    """ดูประวัติทริปของฉัน (ต้องระบุ line_user_id)"""
+    from .models import LineUser, Booking
+    
+    try:
+        line_user = LineUser.objects.get(line_user_id=line_user_id)
+    except LineUser.DoesNotExist:
+        return "ไม่พบข้อมูลผู้ใช้"
+
+    qs = (
+        Booking.objects
+        .filter(customer=line_user.user)
+        .select_related("trip")
+        .order_by("-created_at")
+    )
+
+    if not qs.exists():
+        return "คุณยังไม่มีประวัติการจองทริป"
+
+    rows = []
+    for i, b in enumerate(qs[:10], start=1):
+        rows.append(
+            f"{i}. {b.trip.name} ({b.trip.province}) - {b.get_status_display()}"
+        )
+
+    return "\n".join(rows)

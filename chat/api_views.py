@@ -23,14 +23,16 @@ from .models import (
     Image,
     Equipment,
     BookingEquipment,
+    Rating,
+    Summary,
 )
 from .serializers import (
-
     LineUserSerializer, LineMessageSerializer, ImageSerializer,
     ChatbotSessionSerializer, TripSerializer, BookingSerializer,
-    PaymentSerializer, CustomerSerializer, AdminSerializer, EquipmentSerializer, 
-    BookingEquipmentSerializer,
+    PaymentSerializer, CustomerSerializer, AdminSerializer, EquipmentSerializer,
+    BookingEquipmentSerializer, RatingSerializer, SummarySerializer,
 )
+from .permissions import IsStaffUser, IsStaffOrReadOnly
 
 
 
@@ -41,6 +43,7 @@ class StandardResultsSetPagination(PageNumberPagination):
 
 class LineUserViewSet(viewsets.ModelViewSet):
     """CRUD operations for LINE users"""
+    permission_classes = [IsStaffUser]
     queryset = LineUser.objects.all()
     serializer_class = LineUserSerializer
     pagination_class = StandardResultsSetPagination
@@ -99,6 +102,7 @@ class LineUserViewSet(viewsets.ModelViewSet):
 
 class LineMessageViewSet(viewsets.ModelViewSet):
     """CRUD operations for LINE messages"""
+    permission_classes = [IsStaffUser]
     queryset = LineMessage.objects.all()
     serializer_class = LineMessageSerializer
     pagination_class = StandardResultsSetPagination
@@ -172,6 +176,7 @@ class LineMessageViewSet(viewsets.ModelViewSet):
 
 class ChatbotSessionViewSet(viewsets.ModelViewSet):
     """CRUD operations for chatbot sessions"""
+    permission_classes = [IsStaffUser]
     queryset = ChatbotSession.objects.all()
     serializer_class = ChatbotSessionSerializer
     pagination_class = StandardResultsSetPagination
@@ -194,12 +199,16 @@ class ChatbotSessionViewSet(viewsets.ModelViewSet):
         return queryset.order_by('-created_at')
 
 class ImageViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsStaffOrReadOnly]
     queryset = Image.objects.all()
     serializer_class = ImageSerializer
 
     @action(detail=True, methods=['get'])
     def file(self, request, pk=None):
         img = self.get_object()
+        if img.image_url:
+            from django.shortcuts import redirect
+            return redirect(img.image_url)
         if not img.image_data:
             raise Http404("No image file stored")
         return HttpResponse(img.image_data, content_type="image/jpeg")
@@ -207,6 +216,7 @@ class ImageViewSet(viewsets.ReadOnlyModelViewSet):
 
 class TripViewSet(viewsets.ModelViewSet):
     """CRUD operations for trips"""
+    permission_classes = [IsStaffOrReadOnly]
     queryset = Trip.objects.all()
     serializer_class = TripSerializer
     pagination_class = StandardResultsSetPagination
@@ -294,6 +304,7 @@ class TripViewSet(viewsets.ModelViewSet):
 
 class BookingViewSet(viewsets.ModelViewSet):
     """CRUD operations for bookings"""
+    permission_classes = [IsStaffUser]
     queryset = Booking.objects.all()
     serializer_class = BookingSerializer
     pagination_class = StandardResultsSetPagination
@@ -314,6 +325,7 @@ class BookingViewSet(viewsets.ModelViewSet):
 
 class CustomerViewSet(viewsets.ModelViewSet):
     """CRUD operations for customers"""
+    permission_classes = [IsStaffUser]
     queryset = Customer.objects.all()
     serializer_class = CustomerSerializer
     pagination_class = StandardResultsSetPagination
@@ -334,12 +346,14 @@ class CustomerViewSet(viewsets.ModelViewSet):
 
 class AdminViewSet(viewsets.ModelViewSet):
     """CRUD operations for admins"""
+    permission_classes = [IsStaffUser]
     queryset = Admin.objects.all()
     serializer_class = AdminSerializer
     pagination_class = StandardResultsSetPagination
 
 class PaymentViewSet(viewsets.ModelViewSet):
     """CRUD operations for payments"""
+    permission_classes = [IsStaffUser]
     queryset = Payment.objects.all()
     serializer_class = PaymentSerializer
     pagination_class = StandardResultsSetPagination
@@ -422,6 +436,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
 class EquipmentViewSet(viewsets.ModelViewSet):
     """CRUD operations for equipment"""
+    permission_classes = [IsStaffUser]
     queryset = Equipment.objects.all()
     serializer_class = EquipmentSerializer
     pagination_class = StandardResultsSetPagination
@@ -453,6 +468,7 @@ class EquipmentViewSet(viewsets.ModelViewSet):
     
 class BookingEquipmentViewSet(viewsets.ModelViewSet):
     """CRUD operations for booking equipment"""
+    permission_classes = [IsStaffUser]
     queryset = BookingEquipment.objects.all()
     serializer_class = BookingEquipmentSerializer
     pagination_class = StandardResultsSetPagination
@@ -487,4 +503,62 @@ class BookingEquipmentViewSet(viewsets.ModelViewSet):
             return Response({"total_price": total_price})
 
         return Response({"error": "Booking ID is required"}, status=400)
+
+
+class RatingViewSet(viewsets.ReadOnlyModelViewSet):
+    """Read-only CRUD operations for ratings"""
+    permission_classes = [IsStaffUser]
+    queryset = Rating.objects.all()
+    serializer_class = RatingSerializer
+    pagination_class = StandardResultsSetPagination
+    
+    def get_queryset(self):
+        queryset = Rating.objects.select_related('user', 'trip').all()
+        
+        # Filters
+        trip_id = self.request.query_params.get('trip', None)
+        user_id = self.request.query_params.get('user', None)
+        
+        if trip_id:
+            queryset = queryset.filter(trip__id=trip_id)
+        if user_id:
+            queryset = queryset.filter(user__id=user_id)
+            
+        return queryset.order_by('-created_at')
+
+
+class SummaryViewSet(viewsets.ReadOnlyModelViewSet):
+    """AI-generated review analysis summaries."""
+    permission_classes = [IsStaffUser]
+    queryset = Summary.objects.all()
+    serializer_class = SummarySerializer
+    pagination_class = StandardResultsSetPagination
+
+    @action(detail=False, methods=['get'])
+    def latest(self, request):
+        """Return the most recent summary, or 404 if none exists."""
+        summary = Summary.objects.order_by('-created_at').first()
+        if not summary:
+            return Response(
+                {"detail": "No summary available yet."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(SummarySerializer(summary).data)
+
+    @action(detail=False, methods=['post'])
+    def generate(self, request):
+        """Trigger AI analysis of all ratings and create a new Summary."""
+        from .agent import analyze_reviews
+
+        try:
+            summary = analyze_reviews()
+            return Response(
+                SummarySerializer(summary).data,
+                status=status.HTTP_201_CREATED,
+            )
+        except Exception as e:
+            return Response(
+                {"detail": f"Analysis failed: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 

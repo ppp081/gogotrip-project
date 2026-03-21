@@ -140,15 +140,17 @@ class Payment(models.Model):
     # Payment slip information
     slip_image = models.ImageField(upload_to='payment_slips/', null=True, blank=True)
     slip_uploaded_at = models.DateTimeField(null=True, blank=True)
-    
+    slip_public_url = models.TextField(blank=True, help_text="Public URL after upload to Supabase Storage")
+    slip_storage_path = models.CharField(max_length=512, blank=True, help_text="Object path in bucket e.g. payment/<id>.png")
+
     # Payment verification
     verified_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='verified_payments')
     verified_at = models.DateTimeField(null=True, blank=True)
     verification_notes = models.TextField(blank=True)
-    
+
     # Transaction details
     transaction_id = models.CharField(max_length=100, blank=True)
-    bank_account = models.CharField(max_length=50, blank=True)
+    bank_account = models.CharField(max_length=255, blank=True, help_text="Masked receiver account / PromptPay ref from slip")
     
     paid_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
@@ -176,6 +178,32 @@ class ChatbotSession(models.Model):
     response = models.TextField()
     intent = models.CharField(max_length=100)
     created_at = models.DateTimeField(default=timezone.now)
+
+class Summary(models.Model):
+    """AI-generated analysis of all ratings/reviews."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    total_reviews = models.IntegerField(default=0)
+    average_rating = models.FloatField(default=0)
+
+    positive_count = models.IntegerField(default=0)
+    positive_percentage = models.FloatField(default=0)
+    neutral_count = models.IntegerField(default=0)
+    neutral_percentage = models.FloatField(default=0)
+    negative_count = models.IntegerField(default=0)
+    negative_percentage = models.FloatField(default=0)
+
+    issues = models.JSONField(default=list, blank=True)
+    suggestion = models.TextField(blank=True)
+    faqs = models.JSONField(default=list, blank=True)
+
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Summary {self.created_at:%Y-%m-%d %H:%M} ({self.total_reviews} reviews)"
+
 
 class LineUser(models.Model):
     """Model for LINE users"""

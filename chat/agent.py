@@ -1,141 +1,304 @@
 from __future__ import annotations
+
 import os
-import logging
-from typing import Dict, Any
+import httpx
 import json
+import logging
+from typing import Any, Dict, Literal
+from .models import Booking
+
+from pydantic import BaseModel, Field
 
 from langchain_openai import ChatOpenAI
-from langchain.agents import AgentExecutor, create_openai_tools_agent
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import JsonOutputParser
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, ToolMessage
+
+from langchain.agents import create_agent
+
+import requests
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
+
 from .models import *
-import json
-from pydantic import BaseModel, Field
-from langchain.tools import tool
+from .prompts import (
+    CLASSIFY_SYSTEMPROMPT,
+    build_trip_system_prompt,
+    build_friendly_system_prompt,
+    PAYMENT_VERIFY_SYSTEMPROMPT,
+)
 
+from .tools import get_trips, get_date, get_equipments, get_my_trips
 
-
-class LLM_Response(BaseModel):
-    """Unified schema for chatbot output"""
-    response_type: str = Field(description="Type of response, e.g. text, trip_list, booking_verify, error")
-    response_content: str = Field(description="Main message content, plain text")
-    response_meta: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata such as trips or booking info")
-    
-
-from .prompts import CLASSIFY_SYSTEMPROMPT, TRIP_SYSTEMPROMPT, FRIENDLY_SYSTEMPROMPT, PAYMENT_VERIFY_SYSTEMPROMPT
-from .tools import get_trips, get_date, get_equipments
 
 logger = logging.getLogger(__name__)
 
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
-OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY")
+
+def _extract_last_ai_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text") or "")
+        return "".join(parts)
+    return str(content)
+
+
+def _strip_line_meta_json_suffix(content: str) -> str:
+    """Strip Flex/trip_list metadata blob stored on outbound LineMessage (not needed in LLM context)."""
+    if not content or "[__META_JSON__]" not in content:
+        return (content or "").strip()
+    return content.split("[__META_JSON__]", 1)[0].strip()
+
+
+def _format_stored_history_for_prompt(history: list | None) -> str:
+    """Readable transcript for classify / friendly (oldest → newest)."""
+    if not history:
+        return "(ไม่มีข้อความก่อนหน้า)"
+    lines: list[str] = []
+    for msg in history:
+        if isinstance(msg, HumanMessage):
+            role = "User"
+        elif isinstance(msg, AIMessage):
+            role = "Assistant"
+        else:
+            role = type(msg).__name__
+        text = _extract_last_ai_text(getattr(msg, "content", ""))
+        if isinstance(text, str):
+            text = _strip_line_meta_json_suffix(text)
+        lines.append(f"{role}: {text}")
+    return "\n".join(lines)
+
+
+def _prior_turns_for_classifier(history: list | None) -> list:
+    """DB history ends with the current user message; classifier prompt keeps it only in Latest user message."""
+    if not history:
+        return []
+    if isinstance(history[-1], HumanMessage):
+        return list(history[:-1])
+    return list(history)
+
+
+def _messages_for_admin_agent(user_text: str, history: list | None) -> list:
+    """
+    Admin agent must receive the full thread: prior Human/AI turns plus the current user message.
+    get_chat_history() already ends with the latest HumanMessage (saved before the agent runs).
+    """
+    if history:
+        return list(history)
+    return [HumanMessage(content=user_text)]
+
+
+def _strip_json_code_fence(s: str) -> str:
+    s = s.strip()
+    if not s.startswith("```"):
+        return s
+    lines = s.split("\n")
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _coerce_llm_response_envelope(raw: str) -> Dict[str, Any]:
+    """Turn the admin model's last message into a flat tripbot response dict."""
+    text = _strip_json_code_fence(raw)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {"response_type": "text", "response_content": raw.strip(), "response_meta": {}}
+
+    if not isinstance(data, dict):
+        return {"response_type": "text", "response_content": raw.strip(), "response_meta": {}}
+
+    if "response_type" in data and "response_content" in data:
+        meta = data.get("response_meta") if isinstance(data.get("response_meta"), dict) else {}
+        rc = data["response_content"]
+        if isinstance(rc, (dict, list)):
+            rc = json.dumps(rc, ensure_ascii=False)
+        return {
+            "response_type": str(data["response_type"]),
+            "response_content": str(rc) if rc is not None else "",
+            "response_meta": meta,
+        }
+
+    return {"response_type": "text", "response_content": raw.strip(), "response_meta": {}}
+
+
+def _unwrap_accidental_json_in_response_content(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """If response_content holds a full JSON envelope string, promote fields to top level."""
+    out = dict(resp)
+    rc = out.get("response_content")
+    if not isinstance(rc, str):
+        return out
+    t = rc.strip()
+    if not t.startswith("{"):
+        return out
+    try:
+        inner = json.loads(t)
+    except json.JSONDecodeError:
+        return out
+    if not isinstance(inner, dict) or "response_content" not in inner:
+        return out
+    if "response_type" not in inner:
+        return out
+    out["response_type"] = inner.get("response_type", out.get("response_type"))
+    out["response_content"] = inner.get("response_content", "")
+    im = inner.get("response_meta") if isinstance(inner.get("response_meta"), dict) else {}
+    base = out.get("response_meta") if isinstance(out.get("response_meta"), dict) else {}
+    out["response_meta"] = {**base, **im}
+    return out
+
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+THAI_LLM_API_KEY = os.getenv("THAI_LLM_API_KEY")
+
 
 # ---------------- LLMs ----------------
-# llm_fast = ChatOpenAI(
-#     openai_api_base="https://openrouter.ai/api/v1",
-#     api_key=OPENROUTER_API_KEY,
-#     model="openai/gpt-4o-mini",
-#     temperature=0.0,
+
+# llm_fast = ChatGoogleGenerativeAI(
+#     model="gemini-2.5-flash-lite",
+#     google_api_key=GOOGLE_API_KEY,
+#     temperature=0.7,
 # )
 
-# llm_answer = ChatOpenAI(
-#     openai_api_base="https://openrouter.ai/api/v1",
-#     api_key=OPENROUTER_API_KEY,
-#     model="openai/gpt-4o-mini",
-#     temperature=0.3,
+# llm_answer = ChatGoogleGenerativeAI(
+#     model="gemini-2.5-flash-lite",
+#     google_api_key=GOOGLE_API_KEY,
+#     temperature=0.7,
 # )
 
 llm_fast = ChatOpenAI(
     model="gpt-4.1-mini",
-    temperature=0.5,
+    openai_api_key=OPENAI_API_KEY,
+    temperature=0.7,
 )
 
 llm_answer = ChatOpenAI(
     model="gpt-4.1-mini",
-    temperature=0.5,
-    model_kwargs={"response_format": {"type": "json_object"}}
+    openai_api_key=OPENAI_API_KEY,
+    temperature=0.7,
 )
 
-def safe_prompt(text: str) -> str:
-    return text.replace("{", "{{").replace("}", "}}")
+# ---------------- Response Schema ----------------
+
+class LLM_Response(BaseModel):
+    response_type: str = Field(description="text, trip_list, booking_verify, error")
+    response_content: str = Field(description="Main message")
+    response_meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ClassifyRoute(BaseModel):
+    intent: Literal["admin_chat", "friendly_chat"] = Field(
+        description="admin_chat = trips/bookings/tools; friendly_chat = chit-chat"
+    )
+    reply_language: Literal["th", "en"] = Field(
+        description="th for Thai-heavy messages, en for English-heavy"
+    )
+
 
 # ---------------- Classify Agent ----------------
+
+_DEFAULT_ROUTE = ClassifyRoute(intent="friendly_chat", reply_language="th")
+
+llm_classify_router = llm_fast.with_structured_output(ClassifyRoute)
+
+
 def classify_agent(user_text, history=None):
-    message = f"Message: {user_text}\n (Conversation continues from previous messages): {history}"
+    prior = _prior_turns_for_classifier(history)
+    hist_block = _format_stored_history_for_prompt(prior)
+    message = f"Latest user message:\n{user_text}\n\nPrior conversation (oldest first):\n{hist_block}"
+    try:
+        out = llm_classify_router.invoke(
+            [
+                {"role": "system", "content": CLASSIFY_SYSTEMPROMPT},
+                {"role": "user", "content": message},
+            ]
+        )
+        return out.intent, out.reply_language
+    except Exception:
+        logger.exception("classify_agent structured output failed; using default route")
+        return _DEFAULT_ROUTE.intent, _DEFAULT_ROUTE.reply_language
+
+
+# ---------------- Friendly Agent ----------------
+
+def friendly_agent(user_text, history=None, reply_language: str | None = None):
+
+    prior = _prior_turns_for_classifier(history)
+    hist_block = _format_stored_history_for_prompt(prior)
+    message = f"Latest user message:\n{user_text}\n\nPrior conversation (oldest first):\n{hist_block}"
+    system = build_friendly_system_prompt(reply_language or "th")
+
     response = llm_fast.invoke([
-        {"role": "system", "content": CLASSIFY_SYSTEMPROMPT},
+        {"role": "system", "content": system},
         {"role": "user", "content": message},
     ])
 
-    return response.content.strip().lower()
-
-# --------------- Friendly Agent ----------------
-def friendly_agent(user_text, history=None):
-    message = f"Message: {user_text}\n (Conversation continues from previous messages): {history}"
-    response = llm_fast.invoke([
-        {"role": "system", "content": FRIENDLY_SYSTEMPROMPT},
-        {"role": "user", "content": message},
-    ])
-    return response.content.strip().lower()
-
+    return response.content.strip()
 
 
 # ---------------- Admin Agent ----------------
-def admin_agent(user_text: str, history=None, line_user=None):
 
-    @tool
-    def get_my_trips() -> str:
-        """ดูประวัติทริปของฉัน หรือ ทริปที่ฉันเคยจอง (My booked trips history)
-        ใช้เมื่อผู้ใช้ถามว่า "ทริปของฉันมีอะไรบ้าง", "ขอดูประวัติทริปหน่อย", "ทริปที่ฉันจอง"
-        """
-        if not line_user:
-            return "ระบบไม่สามารถอ้างอิงข้อมูลผู้ใช้ได้"
-        from .models import Booking
-        qs = Booking.objects.filter(customer=line_user.user).select_related('trip').order_by('-created_at')
-        if not qs.exists():
-            return "คุณยังไม่มีประวัติการจองทริปครับ"
-        rows = []
-        for index, b in enumerate(qs[:10], start=1):
-            rows.append(f"{index}. ทริป: {b.trip.name} (จังหวัด: {b.trip.province}) - สถานะ: {b.get_status_display()}")
-        return "ประวัติทริปของคุณมีดังนี้:\n" + "\n".join(rows)
+def admin_agent(user_text: str, history=None, line_user=None, reply_language: str | None = None):
 
-    tools = [get_trips, get_date, get_equipments, get_my_trips]
-    output_parser = JsonOutputParser()
+    # --- Tool Definition ---
+    @tool("get_my_trips")
+    def get_my_trips_tool() -> str:
+        """ดูประวัติทริปของฉัน"""
+        return get_my_trips.invoke({"line_user_id": line_user.line_user_id if line_user else ""})
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", safe_prompt(TRIP_SYSTEMPROMPT)  + "\n\n" + output_parser.get_format_instructions()),
-        MessagesPlaceholder("chat_history", optional=True),
-        ("human", "{input}"),
-        MessagesPlaceholder("agent_scratchpad"),
-    ])
+    tools = [
+        get_trips,
+        get_date,
+        get_equipments,
+        get_my_trips_tool,
+    ]
 
-    agent = create_openai_tools_agent(llm_answer, tools, prompt)
-    executor = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=5)
 
-    result = executor.invoke({
-        "input": user_text,
-        "chat_history": history or [],
-        "agent_scratchpad": [],
-    })
+    # agent = create_react_agent(
+    #     llm_answer,
+    #     tools,
+    #     prompt=build_trip_system_prompt(reply_language or "th"),
+    # )
 
-    raw_output = result.get("output", "").strip()
-    try:
-        start = raw_output.find("{")
-        end = raw_output.rfind("}") + 1
-        json_segment = raw_output[start:end]
-        parsed = output_parser.parse(json_segment)
-        return json.dumps(parsed, ensure_ascii=False)
-    except Exception as e:
-        print(f"[AdminAgent] JSON parse error: {e}")
-        return json.dumps({
-            "response_type": "error",
-            "response_content": "ระบบไม่สามารถแปลงผลลัพธ์เป็น JSON ได้",
-            "response_meta": {}
-        }, ensure_ascii=False)
-    
+    agent = create_agent(
+        model=llm_answer,
+        tools=tools,
+        system_prompt=build_trip_system_prompt(reply_language or "th"),
+    )
+
+
+
+    invoke_messages = _messages_for_admin_agent(user_text, history)
+    result = agent.invoke({"messages": invoke_messages})
+
+    # --- Debug Tool calls ---
+    for msg in result["messages"]:
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                print(f"DEBUG [Admin Agent]: Tool Call -> {tc['name']}({tc['args']})")
+        if isinstance(msg, ToolMessage):
+            print(f"DEBUG [Admin Agent]: Tool Output -> {str(msg.content)[:200]}...")
+
+
+    raw_out = _extract_last_ai_text(result["messages"][-1].content)
+    payload = _coerce_llm_response_envelope(raw_out)
+
+    return json.dumps(payload, ensure_ascii=False)
+
+
+# ---------------- Payment Verify ----------------
 
 def payment_verify_agent(user_id: str, user_slip_b64: str):
-    """Analyze payment slip using multimodal LLM (image input)."""
+
     image_data_url = f"data:image/jpeg;base64,{user_slip_b64}"
 
     response = llm_fast.invoke([
@@ -143,55 +306,34 @@ def payment_verify_agent(user_id: str, user_slip_b64: str):
         {
             "role": "user",
             "content": [
-                {
-                    "type": "text",
-                    "text": f"User {user_id} uploaded this image. Determine if it is a Thai bank transfer slip."
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {"url": image_data_url},
-                },
+                {"type": "text", "text": f"User {user_id} uploaded this slip"},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
             ],
         },
     ])
+
     return response.content.strip().lower()
 
-# --------------------- Trip Summarize Agent
+
+# ---------------- Trip Summary ----------------
+
 def trip_detail_agent(trip_id: str):
+
     try:
         trip = Trip.objects.get(id=trip_id)
     except Trip.DoesNotExist:
-        return "ไม่พบข้อมูลทริปนี้ในระบบครับ"
+        return "ไม่พบข้อมูลทริปนี้"
 
-    message = (
-        f"Trip id: {trip.id}\n"
-        f"Trip name: {trip.name}\n"
-        f"Province: {trip.province}\n"
-        f"Category: {trip.category}\n"
-        f"Date: {trip.start_date:%d/%m/%Y} - {trip.end_date:%d/%m/%Y}\n"
-        f"Price per person: {trip.price_per_person:,.0f} บาท\n"
-        f"Description: {trip.description}\n"
-        f"Content: {trip.content}\n\n"
-        f"(User wants a natural, friendly summary for this trip.)"
-    )
+    message = f"""
+Trip name: {trip.name}
+Province: {trip.province}
+Date: {trip.start_date} - {trip.end_date}
+Price: {trip.price_per_person}
+Description: {trip.description}
+"""
 
     response = llm_fast.invoke([
-        {
-            "role": "system",
-            "content": (
-                "คุณคือผู้ช่วยท่องเที่ยวของ Gogo Trip พูดด้วยน้ำเสียงเป็นมิตร กระชับ ชวนให้ไปเที่ยว\n"
-                "เขียนเป็นย่อหน้าเดียว ไม่เกิน 8–10 บรรทัด\n"
-                "ต้องมีข้อมูล: สถานที่ / ไฮไลต์ / ระยะเวลา / ราคา / เหมาะกับใคร / บรรยากาศ\n"
-                "ใช้ emoji ได้ แต่ไม่เกิน 6 อัน และห้ามใช้ในบรรทัดสุดท้าย\n"
-                "ห้ามใส่ลิงก์ไว้ในเนื้อความหลัก ให้ปิดท้ายด้วย footer แยกบรรทัดแบบนี้เท่านั้น:\n"
-                "\n"
-                "---\n"
-                "ดูรายละเอียดทริปสิผ่าน https://tripbot-frontend-294086862024.asia-southeast1.run.app/blog/{{trip_id}}\n"
-                "---\n"
-                "\n"
-                "ตัวแปร {{trip_id}} คือ slug ที่ backend ส่งมา ห้ามเปลี่ยนแปลงหรือใส่ชื่อทริปแทน"
-            )
-        },
+        {"role": "system", "content": "สรุปทริปให้น่าสนใจและอ่านง่าย"},
         {"role": "user", "content": message},
     ])
 
@@ -199,26 +341,119 @@ def trip_detail_agent(trip_id: str):
 
 
 # ---------------- Orchestrator ----------------
+
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class AgentState(TypedDict, total=False):
+    user_text: str
+    history: Any
+    line_user: Any
+    intent: str
+    reply_language: str
+    response: Dict[str, Any]
+
+def classify_node(state: AgentState):
+    intent, reply_language = classify_agent(state.get("user_text"), state.get("history"))
+    print(f"DEBUG [Classify]: intent={intent}, lang={reply_language}")
+    return {"intent": intent, "reply_language": reply_language}
+
+def route_intent(state: AgentState):
+    if state.get("intent") == "admin_chat":
+        return "admin_chat"
+    return "friendly_chat"
+
+def friendly_node(state: AgentState):
+    print("DEBUG [Node]: Entering Friendly Chat")
+    out = friendly_agent(
+        state.get("user_text"),
+        state.get("history"),
+        state.get("reply_language"),
+    )
+    return {"response": {
+        "response_type": "text",
+        "response_content": out,
+        "response_meta": {
+            "intent": "friendly_chat",
+            "reply_language": state.get("reply_language"),
+        },
+    }}
+
+def admin_node(state: AgentState):
+    print("DEBUG [Node]: Entering Admin Chat (Tools)")
+    result = admin_agent(
+        state.get("user_text"),
+        state.get("history"),
+        state.get("line_user"),
+        state.get("reply_language"),
+    )
+    parsed = json.loads(result)
+    meta = parsed.get("response_meta") or {}
+    meta["reply_language"] = state.get("reply_language")
+    meta["intent"] = "admin_chat"
+    parsed["response_meta"] = meta
+    return {"response": parsed}
+
+def feedback_analysis_node(state: AgentState):
+    return {"response": {
+        "response_type": "feedback_analysis",
+        "response_content": "กำลังวิเคราะห์ความเห็น",
+        "response_meta": {},
+    }}
+
+workflow = StateGraph(AgentState)
+workflow.add_node("classify", classify_node)
+workflow.add_node("friendly_chat", friendly_node)
+workflow.add_node("admin_chat", admin_node)
+
+workflow.add_edge(START, "classify")
+workflow.add_conditional_edges(
+    "classify",
+    route_intent,
+    {
+        "friendly_chat": "friendly_chat",
+        "admin_chat": "admin_chat",
+    },
+)
+workflow.add_edge("friendly_chat", END)
+workflow.add_edge("admin_chat", END)
+
+app_workflow = workflow.compile()
+
+
 def run_agent(user_text: str, history=None, line_user=None) -> Dict[str, Any]:
-    logger.error(f"[Orchestrator] Step #1 Get User Message {user_text}\n")
-    logger.error(f"[Orchestrator] Step #1 Get User History {history}\n")
-    msg_intent = classify_agent(user_text, history)
-    
-    if msg_intent == "friendly_chat":
-        out = friendly_agent(user_text, history)
-        return {
-            "response_type": "text",
-            "response_content": out,
-            "response_meta": {"intent": "friendly_chat"}
-        }
-    if msg_intent == "admin_chat":
-        result = admin_agent(user_text, history, line_user)
-        return json.loads(result)
 
-
+    model_used = getattr(llm_answer, "model_name", getattr(llm_answer, "model", "Unknown"))
+    provider = "Google" if isinstance(llm_answer, ChatGoogleGenerativeAI) else "OpenAI"
     
-    return {
-        "response_type": "error",
-        "response_content": "ไม่เข้าใจครับ",
-        "response_meta": {"intent": "unknown"}
+    print(f"\n{'='*50}")
+    print(f"🤖 กำลังใช้งาน Model: {model_used} ({provider})")
+    print(f"👤 ผู้ใช้: {user_text}")
+
+    logger.info(f"User message: {user_text}")
+
+    initial_state = {
+        "user_text": user_text,
+        "history": history,
+        "line_user": line_user,
     }
+
+    if history:
+        print(f"DEBUG [History]: {len(history)} messages (oldest → newest)")
+        for i, m in enumerate(history):
+            preview = _extract_last_ai_text(getattr(m, "content", ""))
+            if isinstance(preview, str):
+                preview = _strip_line_meta_json_suffix(preview)
+            preview = (preview or "").replace("\n", " ")[:160]
+            print(f"  [{i}] {type(m).__name__}: {preview}…")
+    else:
+        print("DEBUG [History]: (empty)")
+
+    result = app_workflow.invoke(initial_state)
+    response = _unwrap_accidental_json_in_response_content(result["response"])
+
+    ai_response = response.get("response_content", "")
+    print(f"💬 AI: {ai_response}")
+    print(f"{'='*50}\n")
+
+    return response
