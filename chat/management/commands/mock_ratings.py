@@ -33,7 +33,6 @@ class Command(BaseCommand):
                 'capacity': 100, # Increased capacity for more bookings
                 'start_date': timezone.now(),
                 'end_date': timezone.now() + timezone.timedelta(days=3),
-                'created_by': admin_user,
                 'location': Trip.Location.SOUTH,
                 'category': Trip.Category.TRENDING
             }
@@ -116,8 +115,7 @@ class Command(BaseCommand):
                 trip=trip,
                 booking_id=booking.id,
                 user=user,
-                trip_rating=rating_score,
-                service_rating=rating_score, # Simplify to be same as trip rating or close
+                service_rating=rating_score,
                 comment=comment_text,
             )
             

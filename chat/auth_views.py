@@ -3,12 +3,25 @@ Session-based admin auth for dashboard (django.contrib.auth.models.User, is_staf
 """
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
+from chat.models import User as DomainUser
 from django.middleware.csrf import get_token
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+
+
+def _domain_user_payload(auth_user: User) -> dict | None:
+    try:
+        du = auth_user.chat_profile
+    except DomainUser.DoesNotExist:
+        return None
+    return {
+        "id": str(du.id),
+        "name": du.name,
+        "role": du.role,
+    }
 
 
 def _resolve_username(identifier: str) -> str:
@@ -46,16 +59,16 @@ def api_login(request):
             status=status.HTTP_403_FORBIDDEN,
         )
     login(request, user)
-    return Response(
-        {
-            "user": {
-                "id": user.id,
-                "username": user.username,
-                "email": user.email or "",
-                "is_staff": user.is_staff,
-            }
-        }
-    )
+    payload = {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email or "",
+        "is_staff": user.is_staff,
+    }
+    chat = _domain_user_payload(user)
+    if chat:
+        payload["chat_user"] = chat
+    return Response({"user": payload})
 
 
 @csrf_exempt
@@ -72,17 +85,16 @@ def api_me(request):
     u = request.user
     if not u.is_authenticated:
         return Response({"authenticated": False})
-    return Response(
-        {
-            "authenticated": True,
-            "user": {
-                "id": u.id,
-                "username": u.username,
-                "email": u.email or "",
-                "is_staff": u.is_staff,
-            },
-        }
-    )
+    payload = {
+        "id": u.id,
+        "username": u.username,
+        "email": u.email or "",
+        "is_staff": u.is_staff,
+    }
+    chat = _domain_user_payload(u)
+    if chat:
+        payload["chat_user"] = chat
+    return Response({"authenticated": True, "user": payload})
 
 
 @api_view(["GET"])

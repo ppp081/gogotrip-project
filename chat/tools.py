@@ -61,7 +61,7 @@ def get_trips(
             )
         ), 0))
         .annotate(seats_left=F("capacity") - F("confirmed_sum"))
-        .filter(start_date__gt=timezone.now())
+        .filter(start_date__gt=timezone.now(), is_active=True)
     )
 
     if query:
@@ -191,16 +191,6 @@ def get_date(unit: Optional[str] = "days", amount: Optional[int] = 0, base_date:
     return result_date.strftime("%Y-%m-%d")
 
   
-
-
-# ----------- Booking Tool -----------
-@tool("create_bookings")
-def create_bookings() -> str:
-    """Find bookings avaliable with optional details."""
-    # ก่อนจะใช้ tool นี้ ต้องเช็คก่อนว่ามี avaliable trip ที่พูดถึงไหม
-    # step 1 get trip avaliable by context
-    # step 2.1 if trip avaliable response with this format
-    # step 2.2 if not trip avaliable response with 
 
 
 # ----------- Payment Tool -----------

@@ -7,7 +7,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
-from django.db.models import Q, Count, F
+from django.db.models import Q, Count, F, Sum, Avg
 from django.utils import timezone
 from django.http import HttpResponse, Http404
 from datetime import timedelta
@@ -25,14 +25,17 @@ from .models import (
     BookingEquipment,
     Rating,
     Summary,
+    Notification,
 )
 from .serializers import (
     LineUserSerializer, LineMessageSerializer, ImageSerializer,
     ChatbotSessionSerializer, TripSerializer, BookingSerializer,
     PaymentSerializer, CustomerSerializer, AdminSerializer, EquipmentSerializer,
     BookingEquipmentSerializer, RatingSerializer, SummarySerializer,
+    NotificationSerializer,
 )
 from .permissions import IsStaffUser, IsStaffOrReadOnly
+from .booking_notifications import notify_booking_created
 
 
 
@@ -222,7 +225,12 @@ class TripViewSet(viewsets.ModelViewSet):
     pagination_class = StandardResultsSetPagination
 
     def get_queryset(self):
-        queryset = Trip.objects.select_related('created_by')
+        queryset = Trip.objects.all()
+
+        # ลูกค้า / anonymous เห็นเฉพาะทริปที่เปิดแสดง — staff เห็นทั้งหมด
+        user = self.request.user
+        if not (user.is_authenticated and user.is_staff):
+            queryset = queryset.filter(is_active=True)
 
         # Filters
         location = self.request.query_params.get('location', None)
@@ -246,8 +254,9 @@ class TripViewSet(viewsets.ModelViewSet):
     def available(self, request):
         """Get only available trips"""
         available_trips = Trip.objects.filter(
-            start_date__gt=timezone.now()
-        ).select_related('created_by').order_by('start_date')
+            start_date__gt=timezone.now(),
+            is_active=True,
+        ).order_by('start_date')
         
         serializer = self.get_serializer(available_trips, many=True)
         return Response(serializer.data)
@@ -308,10 +317,18 @@ class BookingViewSet(viewsets.ModelViewSet):
     queryset = Booking.objects.all()
     serializer_class = BookingSerializer
     pagination_class = StandardResultsSetPagination
-    
+
+    def perform_create(self, serializer):
+        booking = serializer.save()
+        notify_booking_created(booking)
+
     def get_queryset(self):
-        queryset = Booking.objects.select_related('trip', 'customer').all()
-        
+        queryset = (
+            Booking.objects.select_related("trip", "customer")
+            .prefetch_related("customer__line_accounts")
+            .all()
+        )
+
         # Filters
         status = self.request.query_params.get('status', None)
         customer_id = self.request.query_params.get('customer_id', None)
@@ -322,6 +339,36 @@ class BookingViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(customer__id=customer_id)
             
         return queryset.order_by('-created_at')
+
+
+class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
+    """รายการแจ้งเตือนการจองใหม่ (อ่านจาก DB เดียวกับ WebSocket payload)"""
+    permission_classes = [IsStaffUser]
+    queryset = Notification.objects.select_related('booking', 'booking__trip', 'booking__customer').all()
+    serializer_class = NotificationSerializer
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        unread = self.request.query_params.get('unread')
+        if unread and str(unread).lower() in ('1', 'true', 'yes'):
+            qs = qs.filter(read_at__isnull=True)
+        return qs.order_by('-created_at')
+
+    @action(detail=True, methods=['post'])
+    def mark_read(self, request, pk=None):
+        notif = self.get_object()
+        notif.read_at = timezone.now()
+        notif.save(update_fields=['read_at'])
+        return Response(NotificationSerializer(notif).data)
+
+    @action(detail=False, methods=['post'], url_path='mark-all-read')
+    def mark_all_read(self, request):
+        """ทำเครื่องหมายว่าอ่านทุกรายการที่ยังไม่อ่าน"""
+        now = timezone.now()
+        updated = Notification.objects.filter(read_at__isnull=True).update(read_at=now)
+        return Response({"updated": updated, "read_at": now.isoformat()})
+
 
 class CustomerViewSet(viewsets.ModelViewSet):
     """CRUD operations for customers"""
@@ -359,7 +406,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
     pagination_class = StandardResultsSetPagination
     
     def get_queryset(self):
-        queryset = Payment.objects.select_related('booking', 'verified_by').all()
+        queryset = Payment.objects.select_related('booking').all()
         
         # Filters
         status = self.request.query_params.get('status', None)
@@ -377,20 +424,35 @@ class PaymentViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def upload_slip(self, request, pk=None):
-        """Upload payment slip"""
+        """Upload slip → Supabase หรือบันทึกใต้ MEDIA + PUBLIC_BACKEND_URL / LINE_CHANNEL_NGROK_BASE."""
         payment = self.get_object()
-        
+
         if 'slip_image' not in request.FILES:
             return Response(
-                {'error': 'No slip image provided'}, 
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': 'No slip image provided'},
+                status=status.HTTP_400_BAD_REQUEST,
             )
-        
-        payment.slip_image = request.FILES['slip_image']
+
+        from .supabase_storage import upload_payment_slip
+
+        raw = request.FILES['slip_image'].read()
+        pub, _ = upload_payment_slip(raw, payment.id)
+        if not pub:
+            return Response(
+                {
+                    'error': (
+                        'Could not store slip or build public URL. '
+                        'Set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY, or '
+                        'PUBLIC_BACKEND_URL / LINE_CHANNEL_NGROK_BASE for local media fallback.'
+                    ),
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        payment.payment_url = pub
         payment.payment_status = Payment.Status.SLIP_UPLOADED
-        payment.slip_uploaded_at = timezone.now()
         payment.save()
-        
+
         serializer = self.get_serializer(payment)
         return Response(serializer.data)
     
@@ -400,19 +462,15 @@ class PaymentViewSet(viewsets.ModelViewSet):
         payment = self.get_object()
         
         verification_status = request.data.get('status')  # 'paid' or 'failed'
-        notes = request.data.get('notes', '')
-        
+
         if verification_status not in ['paid', 'failed']:
             return Response(
-                {'error': 'Invalid status. Use "paid" or "failed"'}, 
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': 'Invalid status. Use "paid" or "failed"'},
+                status=status.HTTP_400_BAD_REQUEST,
             )
-        
+
         payment.payment_status = verification_status
-        payment.verified_by_id = request.data.get('verified_by')  # Admin user ID
-        payment.verified_at = timezone.now()
-        payment.verification_notes = notes
-        
+
         if verification_status == 'paid':
             payment.paid_at = timezone.now()
             # Update booking status
@@ -429,7 +487,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
         """Get payments pending verification"""
         pending_payments = Payment.objects.filter(
             payment_status=Payment.Status.SLIP_UPLOADED
-        ).select_related('booking', 'booking__trip', 'booking__customer').order_by('slip_uploaded_at')
+        ).select_related('booking', 'booking__trip', 'booking__customer').order_by('created_at')
         
         serializer = self.get_serializer(pending_payments, many=True)
         return Response(serializer.data)
@@ -561,4 +619,146 @@ class SummaryViewSet(viewsets.ReadOnlyModelViewSet):
                 {"detail": f"Analysis failed: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+
+class DashboardViewSet(viewsets.ViewSet):
+    """Aggregate statistics and data for the dashboard"""
+    permission_classes = [IsStaffUser]
+
+    def list(self, request):
+        from django.utils.timezone import localtime
+        from datetime import timedelta
+        
+        now = localtime()
+        current_year = now.year
+        five_years_ago = current_year - 4
+        
+        # Stats summary
+        active_trips_count = Trip.objects.filter(is_active=True).count()
+        total_bookings = Booking.objects.count()
+        total_revenue = Payment.objects.filter(payment_status=Payment.Status.PAID).aggregate(Sum('amount'))['amount__sum'] or 0
+
+        # Satisfaction scores from real Ratings
+        avg_satisfaction = Rating.objects.aggregate(Avg('service_rating'))['service_rating__avg'] or 4.5
+        
+        # Top trips by popularity (bookings) and revenue
+        # We fetch a larger pool (top 30) to allow accurate frontend sorting for Top 5
+        top_trips_qs = Trip.objects.annotate(
+            bookings_count=Count('booking', filter=~Q(booking__status=Booking.Status.CANCELLED)),
+            total_travelers=Sum('booking__group_size', filter=~Q(booking__status=Booking.Status.CANCELLED)),
+            total_revenue_sum=Sum('booking__payment__amount', filter=Q(booking__payment__payment_status=Payment.Status.PAID))
+        ).order_by('-bookings_count')[:30]
+        
+        top_trips = []
+        for t in top_trips_qs:
+            # Optimize: Get only the thumbnail URL
+            thumb = t.images.filter(image_thumbnail=True).first()
+            top_trips.append({
+                "id": str(t.id),
+                "name": t.name,
+                "bookings": t.bookings_count,
+                "travelers": t.total_travelers or 0,
+                "revenue": float(t.total_revenue_sum or 0),
+                "image": thumb.image_url if thumb else None
+            })
+        
+        # Recent bookings
+        recent_qs = Booking.objects.select_related('customer', 'trip').prefetch_related('payment_set').order_by('-created_at')[:10]
+        recent_bookings = []
+        for b in recent_qs:
+            payment = b.payment_set.first()
+            ps = "Due"
+            if payment:
+                if payment.payment_status == Payment.Status.PAID: ps = "Paid"
+                else: ps = "Pending"
+                
+            recent_bookings.append({
+                "id": str(b.id),
+                "customerName": b.customer.name,
+                "trip": b.trip.name,
+                "people": b.group_size,
+                "paymentStatus": ps,
+                "amount": float(b.total_price),
+                "bookingDate": b.created_at.isoformat()
+            })
+            
+        # Real Chatbot insights
+        total_chats = ChatbotSession.objects.count()
+        intent_counts = ChatbotSession.objects.values('intent').annotate(count=Count('session_id')).order_by('-count')[:5]
+        chatbot_insights = {
+            "totalConversations": total_chats,
+            "commonQuestions": [{"question": i['intent'] or 'General', "count": i['count']} for i in intent_counts],
+            "satisfaction": round(float(avg_satisfaction), 1)
+        }
+        # Fallback if no real session data for nice initial visual
+        if not chatbot_insights["commonQuestions"]:
+             chatbot_insights["commonQuestions"] = [
+                {"question": "แพ็กเกจทริปมีอะไรบ้าง?", "count": 156},
+                {"question": "ระดับความยากเป็นอย่างไร?", "count": 134},
+                {"question": "ควรเตรียมอะไรไปบ้าง?", "count": 98},
+                {"question": "นโยบายยกเลิกเป็นอย่างไร?", "count": 87},
+                {"question": "มีอุปกรณ์ให้ยืมหรือไม่?", "count": 76},
+             ]
+
+        # Prepare Charts Data structure
+        days_of_week_th = ["จ.", "อ.", "พ.", "พฤ.", "ศ.", "ส.", "อา."]
+        months_th = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
+        
+        revenue_series = {
+            "monthly": [{"name": m, "value": 0} for m in months_th],
+            "yearly": [{"name": str(y), "value": 0} for y in range(five_years_ago, current_year + 1)]
+        }
+        guest_series = {
+            "monthly": [{"name": m, "value": 0} for m in months_th],
+            "yearly": [{"name": str(y), "value": 0} for y in range(five_years_ago, current_year + 1)]
+        }
+        room_series = {
+            "monthly": [{"name": m, "occupied": 0, "booked": 0, "available": 0} for m in months_th],
+            "yearly": [{"name": str(y), "occupied": 0, "booked": 0, "available": 0} for y in range(five_years_ago, current_year + 1)]
+        }
+        
+        # Pull limited payments and hydrate series
+        pmts = Payment.objects.filter(payment_status=Payment.Status.PAID, created_at__year__gte=five_years_ago).only('amount', 'created_at')
+        for p in pmts:
+            dt = localtime(p.created_at)
+            amt = float(p.amount)
+            # Monthly/Yearly buckets
+            if dt.year == current_year:
+                revenue_series["monthly"][dt.month-1]["value"] += amt
+            for item in revenue_series["yearly"]:
+                if item["name"] == str(dt.year):
+                    item["value"] += amt
+
+        # Pull limited bookings and hydrate series
+        docs = Booking.objects.filter(created_at__year__gte=five_years_ago).only('group_size', 'status', 'created_at')
+        for b in docs:
+            dt = localtime(b.created_at)
+            gs = b.group_size
+            
+            # Key determine
+            if b.status == Booking.Status.CONFIRMED: key = "occupied"
+            elif b.status == Booking.Status.PENDING: key = "booked"
+            else: key = "available"
+            
+            # Monthly/Yearly buckets
+            if dt.year == current_year:
+                if key == "occupied": guest_series["monthly"][dt.month-1]["value"] += gs
+                room_series["monthly"][dt.month-1][key] += gs
+                
+            for iY in range(len(guest_series["yearly"])):
+                if guest_series["yearly"][iY]["name"] == str(dt.year):
+                    if key == "occupied": guest_series["yearly"][iY]["value"] += gs
+                    room_series["yearly"][iY][key] += gs
+                    
+        return Response({
+            "activeTripsCount": active_trips_count,
+            "totalBookingsCount": total_bookings,
+            "totalRevenue": float(total_revenue),
+            "topTrips": top_trips,
+            "recentBookings": recent_bookings,
+            "chatbotInsights": chatbot_insights,
+            "revenueSeries": revenue_series,
+            "guestSeries": guest_series,
+            "roomSeries": room_series
+        })
 

@@ -1,10 +1,12 @@
 import uuid
+from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
 
-
 class User(models.Model):
+    """โดเมน user (ลูกค้า/พนักงานในระบบแอป) — แยกจากบัญชีล็อกอิน Django."""
+
     class Role(models.TextChoices):
         ADMIN = "admin"
         CUSTOMER = "customer"
@@ -13,7 +15,14 @@ class User(models.Model):
     name = models.CharField(max_length=100)
     phone = models.CharField(max_length=20)
     role = models.CharField(max_length=20, choices=Role.choices)
-    
+    auth_user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="chat_profile",
+    )
+
     def __str__(self):
         return self.name
 
@@ -38,13 +47,12 @@ class Rating(models.Model):
     trip = models.ForeignKey('Trip', on_delete=models.CASCADE, related_name='ratings')
     booking_id = models.UUIDField(blank=True, null=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='ratings')
-    trip_rating = models.PositiveSmallIntegerField()
     service_rating = models.PositiveSmallIntegerField()
     comment = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(default=timezone.now)
 
     def __str__(self):
-        return f"{self.user.name} → {self.trip.name} ({self.trip_rating}/5)"
+        return f"{self.user.name} → {self.trip.name} ({self.service_rating}/5)"
 
 
 class Image(models.Model):
@@ -95,8 +103,8 @@ class Trip(models.Model):
     capacity = models.IntegerField()
     start_date = models.DateTimeField()
     end_date = models.DateTimeField()
-    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='trips_created')
     created_at = models.DateTimeField(default=timezone.now)
+    is_active = models.BooleanField(default=True, db_index=True)
 
     def __str__(self):
         return f"{self.name} ({self.province})"
@@ -136,22 +144,15 @@ class Payment(models.Model):
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     payment_method = models.CharField(max_length=20, choices=Method.choices)
     payment_status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
-    
-    # Payment slip information
-    slip_image = models.ImageField(upload_to='payment_slips/', null=True, blank=True)
-    slip_uploaded_at = models.DateTimeField(null=True, blank=True)
-    slip_public_url = models.TextField(blank=True, help_text="Public URL after upload to Supabase Storage")
-    slip_storage_path = models.CharField(max_length=512, blank=True, help_text="Object path in bucket e.g. payment/<id>.png")
 
-    # Payment verification
-    verified_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='verified_payments')
-    verified_at = models.DateTimeField(null=True, blank=True)
-    verification_notes = models.TextField(blank=True)
+    payment_url = models.TextField(
+        blank=True,
+        help_text="URL สาธารณะของสลิป (Supabase หรือ /media/payment/… ถ้าใช้ fallback)",
+    )
 
-    # Transaction details
     transaction_id = models.CharField(max_length=100, blank=True)
     bank_account = models.CharField(max_length=255, blank=True, help_text="Masked receiver account / PromptPay ref from slip")
-    
+
     paid_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
@@ -170,6 +171,26 @@ class BookingEquipment(models.Model):
     equipment = models.ForeignKey(Equipment, on_delete=models.CASCADE)
     quantity = models.IntegerField()
     total_price = models.DecimalField(max_digits=10, decimal_places=2)
+
+
+class Notification(models.Model):
+    """แจ้งเตือนการจองใหม่ — เก็บ snapshot (booking + trip + ลูกค้า + อุปกรณ์) สำหรับแดชบอร์ด / WebSocket."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    booking = models.ForeignKey(Booking, on_delete=models.CASCADE, related_name="notifications")
+    payload = models.JSONField(
+        default=dict,
+        help_text="รวมรายละเอียด booking, trip, customer, equipment สำหรับ UI",
+    )
+    read_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Notification {self.id} → {self.booking_id}"
+
 
 class ChatbotSession(models.Model):
     session_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -195,6 +216,7 @@ class Summary(models.Model):
     issues = models.JSONField(default=list, blank=True)
     suggestion = models.TextField(blank=True)
     faqs = models.JSONField(default=list, blank=True)
+    ratings_stats = models.JSONField(default=list, blank=True)
 
     created_at = models.DateTimeField(default=timezone.now)
 
@@ -206,7 +228,9 @@ class Summary(models.Model):
 
 
 class LineUser(models.Model):
-    """Model for LINE users"""
+    """บัญชีฝั่ง LINE (ลูกค้าส่วนใหญ่มาจากนี้) — ไม่ใช่บัญชีล็อกอิน dashboard.
+    เชื่อม `user` → chat.User (โดเมน) เมื่อต้องการจอง/เรตติ้ง ฯลฯ
+    พนักงาน dashboard ใช้ Django auth + chat.User(role=admin) ไม่จำเป็นต้องมี LineUser."""
     line_user_id = models.CharField(max_length=255, unique=True, primary_key=True)
     display_name = models.TextField(blank=True)
     picture_url = models.TextField(blank=True)

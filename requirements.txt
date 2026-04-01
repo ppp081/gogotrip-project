@@ -22,6 +22,9 @@ dataclasses-json==0.6.7
 diskcache==5.6.3
 distro==1.9.0
 Django==4.2.11
+channels>=4.0.0
+channels-redis>=4.2.0
+daphne>=4.0.0
 django-cors-headers==4.7.0
 djangorestframework==3.16.0
 docker==7.1.0

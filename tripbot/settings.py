@@ -22,16 +22,17 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 LINE_CHANNEL_NGROK_BASE = os.getenv("LINE_CHANNEL_NGROK_BASE", "")
 
-# SlipOK — ตรวจสลิปโอนเงิน (https://slipok.com)
-# URL: POST https://api.slipok.com/api/line/apikey/<BRANCH_ID>  header x-authorization: <API_KEY>
-SLIPOK_API_KEY = os.getenv("SLIPOK_API_KEY")
-SLIPOK_BRANCH_ID = os.getenv("SLIPOK_BRANCH_ID") or os.getenv("SLIPOK_SECRET_KEY")
+# SlipOK — ตรวจสลิป (https://slipok.com)
+# ส่ง API จริงแค่: SLIPOK_API_KEY (header x-authorization) + SLIPOK_BRANCH_ID (path) + log/amount ใน slipok.py
+# การเทียบผู้รับบนสลิปกับร้าน — ตั้งที่ SlipOK dashboard สาขานั้น (ไม่ได้อ่านจาก env ด้านล่าง)
+# ค่า SLIPOK_BANK_* / SLIPOK_PROMPTPAY_* / SLIPOK_BANK_ACCOUNT_OWNER = ใช้แสดงข้อความชำระเงินใน LINE เท่านั้น
+SLIPOK_API_KEY = (os.getenv("SLIPOK_API_KEY") or "").strip()
+SLIPOK_BRANCH_ID = (os.getenv("SLIPOK_BRANCH_ID") or "").strip()
 SLIPOK_LOG = os.getenv("SLIPOK_LOG", "true").lower() in ("1", "true", "yes")
 SLIPOK_BANK_CODE = os.getenv("SLIPOK_BANK_CODE")
 SLIPOK_BANK_NAME = os.getenv("SLIPOK_BANK_NAME")
 SLIPOK_BANK_NAME_TH = os.getenv("SLIPOK_BANK_NAME_TH")
 SLIPOK_BANK_ACCOUNT_NUMBER = os.getenv("SLIPOK_BANK_ACCOUNT_NUMBER")
-# ข้อความแสดงลูกค้าตอนโอน PromptPay (LINE)
 SLIPOK_PROMPTPAY_NUMBER = os.getenv("SLIPOK_PROMPTPAY_NUMBER")
 SLIPOK_BANK_ACCOUNT_OWNER = os.getenv("SLIPOK_BANK_ACCOUNT_OWNER")
 PROMPTPAY_QR_IMAGE_URL = os.getenv(
@@ -43,6 +44,8 @@ PROMPTPAY_QR_IMAGE_URL = os.getenv(
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_OBJECT_STORAGE = os.getenv("SUPABASE_OBJECT_STORAGE", "app-object-storage")
+# ถ้าไม่มี Supabase key — fallback บันทึกไฟล์ใต้ MEDIA_ROOT และใช้ URL นี้ต่อท้าย /media/...
+PUBLIC_BACKEND_URL = (os.getenv("PUBLIC_BACKEND_URL") or "").strip().rstrip("/")
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -73,7 +76,11 @@ ALLOWED_HOSTS = ['*']  # เปิดกว้างทุก host (เฉพา
 
 # Application definition
 
+# daphne ต้องอยู่ก่อน channels — แล้ว `python manage.py runserver` จะรัน ASGI รองรับ WebSocket
+# (pip install daphne channels)
 INSTALLED_APPS = [
+    'daphne',
+    'channels',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -116,6 +123,30 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'tripbot.wsgi.application'
+ASGI_APPLICATION = 'tripbot.asgi.application'
+
+# Django Channels — WebSocket (React); use Redis in production for multi-worker
+_redis_url = (os.getenv('REDIS_URL') or '').strip()
+if _redis_url:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {'hosts': [_redis_url]},
+        },
+    }
+else:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        },
+    }
+
+# แจ้งเตือน booking ใหม่ (บันทึกลง DB + broadcast WS) — ปิดชั่วคราวเช่น ตอนรัน mock
+BOOKING_NOTIFICATIONS_ENABLED = os.getenv('BOOKING_NOTIFICATIONS_ENABLED', 'true').lower() in (
+    '1', 'true', 'yes',
+)
+# React เชื่อม ws://.../ws/admin/notifications/?token=...
+ADMIN_WS_TOKEN = (os.getenv('ADMIN_WS_TOKEN') or '').strip()
 
 
 # Database

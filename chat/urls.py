@@ -18,6 +18,8 @@ from .api_views import (
     ImageViewSet,
     RatingViewSet,
     SummaryViewSet,
+    NotificationViewSet,
+    DashboardViewSet,
 )
 
 # Create router and register viewsets
@@ -35,6 +37,8 @@ router.register(r'booking-equipments', BookingEquipmentViewSet)
 router.register(r'images', ImageViewSet)
 router.register(r'ratings', RatingViewSet)
 router.register(r'summaries', SummaryViewSet)
+router.register(r'notifications', NotificationViewSet)
+router.register(r'dashboard', DashboardViewSet, basename='dashboard')
 
 urlpatterns = [
     path('auth/login/', api_login),

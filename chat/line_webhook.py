@@ -8,6 +8,7 @@ import traceback
 import json
 import base64
 import re, json, decimal
+import uuid
 from decimal import Decimal
 from datetime import datetime, timezone as dt_timezone
 from django.utils import timezone as tz
@@ -29,7 +30,7 @@ from linebot.models import (
 # LLM Calling
 from .agent import *
 from .models import LineUser, LineMessage, User, Rating, Trip, Booking, Equipment
-from .slipok import verify_slip_image_bytes, slipok_is_configured
+from .slipok import verify_slip, slipok_is_configured
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
@@ -56,6 +57,129 @@ def _format_line_outgoing_for_debug(messages) -> str:
 # LINE Bot API setup
 line_bot_api = LineBotApi(settings.LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(settings.LINE_CHANNEL_SECRET)
+
+
+def _handle_feedback_phase1(line_user, reply_token, payload_str: str) -> None:
+    """Parse feedback:like|dislike:trip_id[:booking_id], set user state, reply with quick replies."""
+    parts = str(payload_str).strip().split(":")
+    if len(parts) < 3:
+        return
+    rating_type = parts[1]
+    trip_id = parts[2]
+    booking_id = parts[3] if len(parts) >= 4 else None
+
+    line_user.user_status = "waiting_for_reason"
+    line_user.user_metadata = {
+        "trip_id": trip_id,
+        "rating_type": rating_type,
+        "booking_id": booking_id,
+    }
+    line_user.save(update_fields=["user_status", "user_metadata"])
+
+    if rating_type == "like":
+        text_content = "ดีใจที่ประทับใจครับ 😊\nเลือกสิ่งที่ชอบที่สุดได้เลยครับ"
+        quick_reply = QuickReply(
+            items=[
+                QuickReplyButton(action=MessageAction(label="🧑‍✈️ ไกด์ดูแลดี", text="ไกด์ดูแลดี")),
+                QuickReplyButton(action=MessageAction(label="📋 โปรแกรมจัดดี", text="โปรแกรมจัดดี")),
+                QuickReplyButton(action=MessageAction(label="🏨 ที่พักสบาย", text="ที่พักสบาย")),
+                QuickReplyButton(action=MessageAction(label="🌿 บรรยากาศดี", text="บรรยากาศดี")),
+            ]
+        )
+    else:
+        text_content = "เราเสียใจที่ทริปนี้ยังไม่ตรงใจครับ 🙏\nช่วยบอกเราหน่อยนะครับว่าเรื่องไหนที่ควรปรับปรุง"
+        quick_reply = QuickReply(
+            items=[
+                QuickReplyButton(action=MessageAction(label="🧑‍✈️ ไกด์ไม่สุภาพ", text="ไกด์ไม่สุภาพ")),
+                QuickReplyButton(action=MessageAction(label="🏨 ที่พักไม่ตรงปก", text="ที่พักไม่ตรงปก")),
+                QuickReplyButton(action=MessageAction(label="🍽️ อาหารไม่ถูกปาก", text="อาหารไม่ถูกปาก")),
+                QuickReplyButton(action=MessageAction(label="📋 โปรแกรมไม่น่าสนใจ", text="โปรแกรมไม่น่าสนใจ")),
+            ]
+        )
+
+    line_bot_api.reply_message(
+        reply_token,
+        TextSendMessage(text=text_content, quick_reply=quick_reply),
+    )
+
+
+def _service_rating_quick_reply() -> QuickReply:
+    """Quick reply 1–5 ดาวสำหรับคะแนนการบริการ (postback เพื่อไม่โชว์ payload ในแชท)"""
+    items = []
+    for n in range(1, 6):
+        items.append(
+            QuickReplyButton(
+                action=PostbackAction(
+                    label=f"{n}⭐",
+                    data=f"servicerate:{n}",
+                    display_text=f"ให้คะแนน {n} ดาว🌟",
+                )
+            )
+        )
+    return QuickReply(items=items)
+
+
+def _apply_service_rating(line_user, reply_token, stars: int) -> None:
+    """สร้าง Rating หลังผู้ใช้เลือกคะแนนการบริการ 1–5 (ข้อมูลค้างจาก user_metadata)"""
+    md = line_user.user_metadata or {}
+    trip_id = md.get("trip_id")
+    booking_raw = md.get("booking_id")
+    comment = md.get("comment") or ""
+
+    if not trip_id:
+        logger.warning("Service rating: missing trip_id in metadata")
+        line_user.user_status = "idle"
+        line_user.user_metadata = {}
+        line_user.save(update_fields=["user_status", "user_metadata"])
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(text="ขออภัยครับ ไม่พบข้อมูลการให้คะแนน กรุณาเริ่มจากขั้นตอน feedback ใหม่นะครับ 🙏"),
+        )
+        return
+
+    booking_id = None
+    if booking_raw not in (None, ""):
+        try:
+            booking_id = uuid.UUID(str(booking_raw))
+        except (ValueError, TypeError):
+            booking_id = None
+
+    try:
+        trip = Trip.objects.get(id=trip_id)
+        Rating.objects.create(
+            trip=trip,
+            user=line_user.user,
+            booking_id=booking_id,
+            service_rating=stars,
+            comment=comment,
+        )
+        logger.info(
+            f"Rating saved trip={trip_id} booking={booking_id} service_rating={stars} user={line_user.user}"
+        )
+    except Exception as e:
+        logger.error(f"Error saving Rating (service_rating): {e}")
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(
+                text="ขออภัยครับ ระบบบันทึกคะแนนไม่สำเร็จ กรุณาลองใหม่อีกครั้งหรือติดต่อทีมงานนะครับ 🙏"
+            ),
+        )
+        return
+
+    line_user.user_status = "idle"
+    line_user.user_metadata = {}
+    line_user.save(update_fields=["user_status", "user_metadata"])
+
+    line_bot_api.reply_message(
+        reply_token,
+        TextSendMessage(
+            text=(
+                "ขอบคุณสำหรับคะแนนการบริการครับ 🌟\n"
+                "ความเห็นของคุณช่วยให้เราพัฒนาประสบการณ์ให้ดียิ่งขึ้น\n"
+                "แล้วพบกันใหม่ในทริปหน้านะครับ ✨"
+            )
+        ),
+    )
 
 
 @csrf_exempt
@@ -107,42 +231,20 @@ def handle_text_message(event):
         
         # จัดการ Phase 1 (เข้าสู่โหมดให้คะแนน)
         if str(incoming_message.content).startswith("feedback:"):
-            parts = str(incoming_message.content).split(":")
-            if len(parts) >= 3:
-                rating_type = parts[1]  # "like" or "dislike"
-                trip_id = parts[2]
-                booking_id = parts[3] if len(parts) >= 4 else None
-                
-                line_user.user_status = "waiting_for_reason"
-                line_user.user_metadata = {
-                    "trip_id": trip_id,
-                    "rating_type": rating_type,
-                    "booking_id": booking_id
-                }
-                line_user.save(update_fields=["user_status", "user_metadata"])
-                
-                if rating_type == "like":
-                    text_content = "ดีใจที่ประทับใจครับ 😊\nเลือกสิ่งที่ชอบที่สุดได้เลยครับ"
-                    quick_reply = QuickReply(items=[
-                        QuickReplyButton(action=MessageAction(label="🧑‍✈️ ไกด์ดูแลดี", text="ไกด์ดูแลดี")),
-                        QuickReplyButton(action=MessageAction(label="📋 โปรแกรมจัดดี", text="โปรแกรมจัดดี")),
-                        QuickReplyButton(action=MessageAction(label="🏨 ที่พักสบาย", text="ที่พักสบาย")),
-                        QuickReplyButton(action=MessageAction(label="🌿 บรรยากาศดี", text="บรรยากาศดี"))
-                    ])
-                else:
-                    text_content = "เราเสียใจที่ทริปนี้ยังไม่ตรงใจครับ 🙏\nช่วยบอกเราหน่อยนะครับว่าเรื่องไหนที่ควรปรับปรุง"
-                    quick_reply = QuickReply(items=[
-                        QuickReplyButton(action=MessageAction(label="🧑‍✈️ ไกด์ไม่สุภาพ", text="ไกด์ไม่สุภาพ")),
-                        QuickReplyButton(action=MessageAction(label="🏨 ที่พักไม่ตรงปก", text="ที่พักไม่ตรงปก")),
-                        QuickReplyButton(action=MessageAction(label="🍽️ อาหารไม่ถูกปาก", text="อาหารไม่ถูกปาก")),
-                        QuickReplyButton(action=MessageAction(label="📋 โปรแกรมไม่น่าสนใจ", text="โปรแกรมไม่น่าสนใจ"))
-                    ])
-                
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text=text_content, quick_reply=quick_reply)
-                )
+            _handle_feedback_phase1(line_user, event.reply_token, incoming_message.content)
+            return
+
+        # Phase 3b: รอคะแนนการบริการ 1–5 ดาว
+        if user_status == "waiting_for_service_rating":
+            content = str(incoming_message.content).strip()
+            if content.isdigit() and 1 <= int(content) <= 5:
+                _apply_service_rating(line_user, event.reply_token, int(content))
                 return
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="กรุณาเลือกคะแนน 1–5 ดาวจากปุ่มด้านล่างนะครับ 🙏"),
+            )
+            return
 
         # Phase 2: รับเหตุผลแล้วถามความเห็นเพิ่มเติม
         if user_status == "waiting_for_reason":
@@ -181,36 +283,30 @@ def handle_text_message(event):
                 reason = user_metadata.get("reason", "")
                 comments = user_metadata.get("comments", [])
                 booking_id = user_metadata.get("booking_id")
-                
+
                 if content == "ส่งความเห็น" and comments:
                     final_comment = "\n".join(comments) + f"\n[หมวดหมู่: {reason}]"
                 else:
                     final_comment = f"[หมวดหมู่: {reason}]"
 
-                try:
-                    trip = Trip.objects.get(id=trip_id)
-                    trip_rating = 5 if rating_type == "like" else 2
-                    service_rating = 5 if rating_type == "like" else 2
-                    
-                    Rating.objects.create(
-                        trip=trip,
-                        user=line_user.user,
-                        booking_id=booking_id,
-                        trip_rating=trip_rating,
-                        service_rating=service_rating,
-                        comment=final_comment
-                    )
-                    logger.info(f"Rating saved for trip={trip_id}, booking={booking_id}, user={line_user.user}")
-                except Exception as e:
-                    logger.error(f"Error saving Rating: {str(e)}")
-                    
-                line_user.user_status = "idle"
-                line_user.user_metadata = {}
+                line_user.user_status = "waiting_for_service_rating"
+                line_user.user_metadata = {
+                    "trip_id": str(trip_id) if trip_id else None,
+                    "booking_id": str(booking_id) if booking_id else None,
+                    "comment": final_comment,
+                    "rating_type": rating_type,
+                }
                 line_user.save(update_fields=["user_status", "user_metadata"])
-                
+
+                thank_you = (
+                    "ขอบคุณที่แบ่งปันความเห็นให้เรานะครับ 🙏\n"
+                    "ทุกความคิดเห็นช่วยให้ GoGoTrip พัฒนาประสบการณ์ให้ดียิ่งขึ้น\n\n"
+                    "ช่วยให้คะแนนการบริการของเราในครั้งนี้หน่อยได้ไหมครับ?\n"
+                    "(เลือก 1–5 ดาวจากปุ่มด้านล่างได้เลยครับ)"
+                )
                 line_bot_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(text="ขอบคุณสำหรับ feedback ของคุณครับ 🙏\nความคิดเห็นของคุณมีค่ากับเรามาก แล้วพบกันทริปหน้านะครับ ✨")
+                    TextSendMessage(text=thank_you, quick_reply=_service_rating_quick_reply()),
                 )
                 return
             else:
@@ -330,6 +426,9 @@ def handle_text_message(event):
 
                 # Booking Verfify (Flex)
                 if response_type == "booking_verify" and response_meta:
+                    # Save metadata for later postback
+                    line_user.user_metadata = response_meta
+                    line_user.save(update_fields=["user_metadata"])
                     flex_payload = build_booking_verify_flex(response_meta)
                     messages.append(FlexSendMessage(
                         alt_text="ยืนยันรายละเอียดการจองทริป",
@@ -406,7 +505,7 @@ def handle_image_message(event):
             except Exception:
                 line_bot_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(text="ไฟล์รูปไม่ถูกต้อง กรุณาส่งสลิปเป็น JPG/PNG ชัด ๆ อีกครั้งครับ"),
+                    TextSendMessage(text="ไม่สามารถดึงรูปสลิปได้ครับ ไฟล์สลิปไม่ถูกต้องกรุณาส่งสลิปเป็น JPG/PNG ที่ชัด ๆ อีกครั้งครับ"),
                 )
                 return
 
@@ -415,7 +514,7 @@ def handle_image_message(event):
             # if "confirm" in agent_response: ...
 
             if not slipok_is_configured():
-                logger.error("SlipOK missing SLIPOK_API_KEY or SLIPOK_BRANCH_ID/SLIPOK_SECRET_KEY")
+                logger.error("SlipOK missing SLIPOK_API_KEY or SLIPOK_BRANCH_ID")
                 line_bot_api.reply_message(
                     event.reply_token,
                     TextSendMessage(
@@ -424,26 +523,41 @@ def handle_image_message(event):
                 )
                 return
 
-            bd = _pending_payment_breakdown(line_user)
-            expected_total = bd["grand_total"] if bd else None
-            slip_res = verify_slip_image_bytes(
-                raw_bytes, expected_amount_baht=expected_total
+            # ยอดเดียวจากคำสั่งจอง — ใช้ทั้งแสดงให้ลูกค้าและส่งให้ SlipOK เทียบ
+            payment_detail = _pending_payment_breakdown(line_user)
+            # expected_amount_baht = payment_detail["grand_total"] if payment_detail else None
+            expected_amount_baht = 1
+
+            slip_verification = verify_slip(
+                raw_bytes, expected_amount_baht=expected_amount_baht
+            )
+            try:
+                payload_preview = json.dumps(slip_verification.payload or {}, ensure_ascii=False)[:1200]
+            except Exception:
+                payload_preview = str(slip_verification.payload)[:1200]
+            logger.info(
+                "[slip_verify] line_user_id=%s image_bytes=%s expected_amount_baht=%s "
+                "ok=%s http=%s api_code=%s slip_amount=%s",
+                user_id,
+                len(raw_bytes),
+                expected_amount_baht,
+                slip_verification.ok,
+                slip_verification.http_status,
+                slip_verification.api_code,
+                slip_verification.slip_amount,
             )
             logger.info(
-                "SlipOK result ok=%s http=%s code=%s msg=%s slip_amt=%s",
-                slip_res.ok,
-                slip_res.http_status,
-                slip_res.api_code,
-                slip_res.message[:120] if slip_res.message else "",
-                slip_res.slip_amount,
+                "[slip_verify] message=%s",
+                (slip_verification.message or "")[:300],
             )
+            logger.info("[slip_verify] payload=%s", payload_preview)
 
-            if slip_res.ok:
+            if slip_verification.ok:
                 meta = line_user.user_metadata or {}
                 booking, payment, confirm_meta = create_booking_and_payment(
                     line_user,
                     meta,
-                    slip_ok_payload=slip_res.payload,
+                    slip_ok_payload=slip_verification.payload,
                     slip_image_bytes=raw_bytes,
                 )
                 flex_payload = booking_confirm_flex(confirm_meta)
@@ -473,15 +587,26 @@ def handle_image_message(event):
                 line_user.user_metadata = {}
                 line_user.save(update_fields=["user_status", "user_metadata"])
             else:
-                extra = ""
-                if slip_res.api_code == 1013 and expected_total is not None and slip_res.slip_amount is not None:
-                    extra = (
-                        f"\n\nยอดที่ต้องชำระ: {int(expected_total):,} บาท\n"
-                        f"ยอดบนสลิป: {int(slip_res.slip_amount):,} บาท"
+                if expected_amount_baht is not None:
+                    amount_line = f"ยอดที่ต้องชำระ (จากระบบจอง): {int(expected_amount_baht):,} บาท"
+                else:
+                    amount_line = (
+                        "ยอดที่ต้องชำระ: — (ไม่พบยอดในระบบ — พิมพ์ «ชำระเงิน» เพื่อดูรายละเอียด)"
                     )
-                elif slip_res.api_code == 1010:
-                    extra = "\n\nลองส่งสลิปใหม่อีกครั้งหลังเวลาที่แนะนำครับ"
-                reply_text = f"❌ {slip_res.message}{extra}\n\nกรุณาตรวจสอบและส่งสลิปใหม่อีกครั้งครับ 🙏"
+                if slip_verification.slip_amount is not None:
+                    slip_line = f"ยอดบนสลิป (จาก SlipOK): {int(slip_verification.slip_amount):,} บาท"
+                else:
+                    slip_line = (
+                        "ยอดบนสลิป (จาก SlipOK): — "
+                        "(ยังอ่านยอดไม่ได้ — ลองส่งสลิปเต็ม ชัด ๆ หรือสลิปโอนจริง)"
+                    )
+                reply_text = (
+                    f"❌ {slip_verification.message}\n\n"
+                    "📋 รายละเอียดการชำระ:\n"
+                    f"{amount_line}\n"
+                    f"{slip_line}\n\n"
+                    "กรุณาตรวจสอบยอดให้ตรงกัน แล้วส่งภาพสลิปการโอนใหม่ให้ชัดเจนอีกครั้งครับ 🙏"
+                )
                 line_bot_api.reply_message(
                     event.reply_token,
                     TextSendMessage(text=reply_text),
@@ -522,9 +647,27 @@ def handle_sticker_message(event):
 @handler.add(PostbackEvent)
 def handle_postback(event):
     data = event.postback.data
+    line_user = get_or_create_line_user(event.source.user_id)
+
+    if data.startswith("feedback:"):
+        _handle_feedback_phase1(line_user, event.reply_token, data)
+        return
+
+    if data.startswith("servicerate:"):
+        parts = data.split(":")
+        if len(parts) >= 2 and parts[1].isdigit():
+            stars = int(parts[1])
+            if 1 <= stars <= 5 and getattr(line_user, "user_status", "") == "waiting_for_service_rating":
+                _apply_service_rating(line_user, event.reply_token, stars)
+            elif 1 <= stars <= 5:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="ขอบคุณครับ ตอนนี้ไม่ได้อยู่ในขั้นตอนให้คะแนนนะครับ 🙏"),
+                )
+        return
+
     params = dict(item.split("=") for item in data.split("&"))
     action = params.get("action")
-    line_user = get_or_create_line_user(event.source.user_id)
 
     print("[DEBUG]: postback action", action)
 
@@ -599,44 +742,30 @@ def handle_postback(event):
     elif action == "confirm_booking":
         print("[DEBUG]: confirm_booking")
 
-        trip_id   = params.get("trip_id")
-        count     = params.get("count")
-        equipment = params.get("equipment")
-
-        # --- แปลง equipment string → list ของ dict ---
-        booking_equipment = []
-        if equipment:
+        metadata = line_user.user_metadata or {}
+        trip_id   = metadata.get("trip_id")
+        
+        # Ensure count is int
+        try:
+            count = int(metadata.get("booking_person_count", 1))
+            metadata["booking_person_count"] = count
+        except:
+            count = 1
+            
+        booking_equipment = metadata.get("booking_equipment") or []
+        for eq in booking_equipment:
             try:
-                parts = [p for p in equipment.split(",") if p]
-                for part in parts:
-                    # ตอนนี้ format คือ id:name:qty:price
-                    eq_id, name, qty, price = part.split(":")
-                    booking_equipment.append({
-                        "equipment_id": eq_id,
-                        "name": name,
-                        "qty": int(qty),
-                        "price": price,
-                    })
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to parse equipment '{equipment}': {e}")
-                booking_equipment = []
+                eq["qty"] = int(eq.get("qty", 1))
+            except:
+                eq["qty"] = 1
 
-
-        metadata = {
-            "trip_id": trip_id,
-            "booking_person_count": int(count),
-            "booking_equipment": booking_equipment,
-            "response_state": "PENDING_PAYMENT",
-            "customer_name": params.get("customer_name"),
-            "customer_phone": params.get("customer_phone"),
-            "customer_email": params.get("customer_email"),
-        }
-        print("[DEBUG METADATA BEFORE SAVE]:", metadata)  
-        line_user.user_metadata = metadata
+        metadata["response_state"] = "PENDING_PAYMENT"
         line_user.user_status = "pending_payment"
+        # Update normalized data back
+        line_user.user_metadata = metadata
         line_user.save(update_fields=["user_metadata", "user_status"])
 
-        bd = _pending_payment_breakdown(line_user)
+        payment_detail = _pending_payment_breakdown(line_user)
         response_parts = [
             "ขอบคุณครับ! ยืนยันการจองทริปเรียบร้อยแล้ว 🎉",
             "",
@@ -644,8 +773,10 @@ def handle_postback(event):
             f"👥 จำนวนผู้เดินทาง: {count} คน",
             f"🎒 อุปกรณ์เพิ่มเติม: {len(booking_equipment)} รายการ",
         ]
-        if bd:
-            response_parts.extend(["", f"💰 ยอดที่ต้องชำระ: {int(bd['grand_total']):,} บาท"])
+        if payment_detail:
+            response_parts.extend(
+                ["", f"💰 ยอดที่ต้องชำระ: {int(payment_detail['grand_total']):,} บาท"]
+            )
         response_parts.extend(["", *_promptpay_instruction_lines()])
         response_content = "\n".join(response_parts)
 
@@ -854,42 +985,45 @@ def build_trip_carousel_flex(meta):
 def build_booking_verify_flex(meta):
     trip_id                 = meta.get("trip_id") or "-"
     trip_name               = meta.get("trip_name") or "Trip_Name"
-    # trip_description        = meta.get("trip_description") or "-"
     trip_province           = meta.get("trip_province") or "-"
     trip_date               = meta.get("trip_date") or "-"
-    trip_price_per_person   = meta.get("trip_price_per_person") or "-"
-    trip_total_price        = meta.get("trip_total_price") or "-"
+    trip_price_per_person   = meta.get("trip_price_per_person") or "0"
     trip_image_url          = meta.get("trip_image_url") or "-"
     customer_name           = meta.get("customer_name") or "-"
     customer_phone          = meta.get("customer_phone") or "-"
     customer_email          = meta.get("customer_email") or "-"
-    booking_person_count    = meta.get("booking_person_count") or "-"
+    booking_person_count    = meta.get("booking_person_count") or "1"
     booking_equipment       = meta.get("booking_equipment") or []
     
-    # แก้ไขส่วนนี้ให้ครบ id:name:qty:price
-    equipment_data = ",".join([
-        f"{eq['equipment_id']}:{eq['name']}:{eq.get('qty') or 0}:{eq.get('price') or 0}"
-        for eq in booking_equipment
-        if eq.get("equipment_id")
-    ])
-    
-    postback_data = (
-        f"action=confirm_booking"
-        f"&trip_id={trip_id}"
-        f"&count={booking_person_count}"
-        f"&equipment={equipment_data}"
-        f"&customer_name={customer_name}"
-        f"&customer_phone={customer_phone}"
-        f"&customer_email={customer_email}"
-    )
+    # Calculate price automatically
+    def parse_price(val):
+        try: return float(str(val).replace(',', '').strip())
+        except: return 0.0
+        
+    price_per = parse_price(trip_price_per_person)
+    try: qty_person = int(booking_person_count)
+    except: qty_person = 1
+        
+    total = price_per * qty_person
+    for eq in booking_equipment:
+        total += parse_price(eq.get("price")) * int(eq.get("qty") or 1)
+        
+    trip_total_price = f"{total:,.2f}"
+
+    postback_data = "action=confirm_booking"
     
     print("\n[DEBUG]: booking_verify flex message data \n", postback_data , "\n")
-    # action=confirm_booking&trip_id=123&count=5&equipment=UUID1:ร่มกันแดด:2:350.00,UUID2:เสื้อกันฝน:3:200.00&customer_name=John&customer_phone=0812345678&customer_email=john@email.com
+    
+    # Fix URL scheme
+    valid_url = "https://via.placeholder.com/600x400"
+    if str(trip_image_url).startswith("http://") or str(trip_image_url).startswith("https://"):
+        valid_url = trip_image_url
+
     return {
         "type": "bubble",
         "hero": {
             "type": "image",
-            "url": trip_image_url,
+            "url": valid_url,
             "size": "full",
             "aspectRatio": "20:13",
             "aspectMode": "cover",
@@ -1425,7 +1559,7 @@ def _promptpay_transfer_lines() -> list[str]:
     if owner:
         lines.append(f"👤 ชื่อบัญชี / ผู้รับเงิน: {owner}")
     if pp:
-        lines.append(f"📱 เลข PromptPay: {pp}")
+        lines.append(f"📱 PromptPay (เบอร์โทร): {pp}")
     if not (bank or owner or pp):
         lines.append("ดูเลข PromptPay ได้จาก QR ในภาพที่ทีมส่งให้ครับ")
     lines.extend(
@@ -1514,21 +1648,21 @@ def build_pending_payment_detail_text(line_user) -> str:
             "ยังไม่พบข้อมูลการจองค้างชำระในระบบครับ\n"
             "หากชำระไปแล้วหรือมีข้อสงสัย รบกวนติดต่อทีมงานครับ 🙏"
         )
-    d = _pending_payment_breakdown(line_user)
-    if d is None:
+    breakdown = _pending_payment_breakdown(line_user)
+    if breakdown is None:
         return "ไม่พบข้อมูลทริปครับ กรุณาติดต่อทีมงานครับ"
 
-    trip = d["trip"]
-    person_count = d["person_count"]
-    base = d["base"]
-    trip_subtotal = d["trip_subtotal"]
-    equip_lines = d["equip_lines"]
-    equip_total = d["equip_total"]
-    grand_total = d["grand_total"]
-    trip_date = d["trip_date"]
-    cust_name = d["cust_name"]
-    cust_phone = d["cust_phone"]
-    cust_email = d["cust_email"]
+    trip = breakdown["trip"]
+    person_count = breakdown["person_count"]
+    base = breakdown["base"]
+    trip_subtotal = breakdown["trip_subtotal"]
+    equip_lines = breakdown["equip_lines"]
+    equip_total = breakdown["equip_total"]
+    grand_total = breakdown["grand_total"]
+    trip_date = breakdown["trip_date"]
+    cust_name = breakdown["cust_name"]
+    cust_phone = breakdown["cust_phone"]
+    cust_email = breakdown["cust_email"]
 
     lines: list[str] = [
         "💰 รายละเอียดการชำระเงิน (คำสั่งจองของคุณ)",
@@ -1561,38 +1695,112 @@ def build_pending_payment_detail_text(line_user) -> str:
     return "\n".join(lines)
 
 
-def _slip_payload_payment_fields(slip_payload: dict | None) -> dict:
-    """ดึงฟิลด์สำหรับ Payment จาก body SlipOK (data.sender/receiver/amount/transRef ฯลฯ)"""
+def _merge_nested_slip_receiver_sender(d: dict) -> dict:
+    """รวมข้อมูล receiver/sender แบบซ้อน (SlipOK เก่า) เข้า key แบน receiver_account / sender_account ฯลฯ"""
+    out = dict(d)
+    recv = d.get("receiver") if isinstance(d.get("receiver"), dict) else {}
+    recv_acct = recv.get("account") if isinstance(recv.get("account"), dict) else {}
+    send = d.get("sender") if isinstance(d.get("sender"), dict) else {}
+    send_acct = send.get("account") if isinstance(send.get("account"), dict) else {}
+    if recv.get("displayName") and not out.get("receiver_displayName"):
+        out["receiver_displayName"] = recv.get("displayName")
+    if recv_acct.get("value") and not out.get("receiver_account"):
+        out["receiver_account"] = recv_acct.get("value")
+    if send.get("displayName") and not out.get("sender_displayName"):
+        out["sender_displayName"] = send.get("displayName")
+    if send_acct.get("value") and not out.get("sender_account"):
+        out["sender_account"] = send_acct.get("value")
+    if d.get("message") is not None and out.get("slip_message") is None:
+        out["slip_message"] = d.get("message")
+    return out
+
+
+def _extract_slip_transaction_dict(slip_payload: dict | None) -> dict:
+    """
+    ดึง dict รายการโอนจาก response SlipOK รองรับหลายรูปแบบ:
+    - แบบแบน: transRef, amount, receiver_displayName, sender_account, ... (ระดับเดียวกับ data)
+    - แบบห่อ: { success, data: { data: { transRef, ... } } } หรือ { data: { transRef, ... } }
+    - แบบเก่า: data.receiver / data.sender แบบซ้อน account
+    """
     if not slip_payload or not isinstance(slip_payload, dict):
         return {}
-    data = slip_payload.get("data")
-    if not isinstance(data, dict):
+
+    # 1) แบบแบน — โดยตรง (หรือผลที่แยกจาก data แล้ว)
+    if slip_payload.get("transRef") and "data" not in slip_payload:
+        return slip_payload
+
+    d = slip_payload.get("data")
+    if not isinstance(d, dict):
         return {}
-    recv = data.get("receiver") if isinstance(data.get("receiver"), dict) else {}
+
+    # 2) ซ้อนอีกชั้น data.data (บางรุ่น API)
+    inner = d.get("data")
+    if isinstance(inner, dict) and inner.get("transRef"):
+        return _merge_nested_slip_receiver_sender(inner)
+
+    # 3) แบบแบนอยู่ใต้ data (อาจมี receiver/sender ซ้อนอยู่ด้วย)
+    if d.get("transRef"):
+        return _merge_nested_slip_receiver_sender(d)
+
+    # 4) แบบเก่า: receiver / sender เป็น object
+    recv = d.get("receiver") if isinstance(d.get("receiver"), dict) else {}
     recv_acct = recv.get("account") if isinstance(recv.get("account"), dict) else {}
-    send = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+    send = d.get("sender") if isinstance(d.get("sender"), dict) else {}
     send_acct = send.get("account") if isinstance(send.get("account"), dict) else {}
     detail = {
-        "transRef": data.get("transRef"),
-        "amount": data.get("amount"),
-        "paidLocalAmount": data.get("paidLocalAmount"),
-        "transDate": data.get("transDate"),
-        "transTime": data.get("transTime"),
-        "receivingBank": data.get("receivingBank"),
-        "sendingBank": data.get("sendingBank"),
+        "transRef": d.get("transRef"),
+        "amount": d.get("amount"),
+        "paidLocalAmount": d.get("paidLocalAmount"),
+        "transDate": d.get("transDate"),
+        "transTime": d.get("transTime"),
+        "receivingBank": d.get("receivingBank"),
+        "sendingBank": d.get("sendingBank"),
         "receiver_displayName": recv.get("displayName"),
         "receiver_account": recv_acct.get("value"),
         "sender_displayName": send.get("displayName"),
         "sender_account": send_acct.get("value"),
-        "language": data.get("language"),
-        "slip_message": data.get("message"),
+        "language": d.get("language"),
+        "slip_message": d.get("message"),
     }
-    tx = str(data.get("transRef") or "")[:100]
-    recv_val = recv_acct.get("value") or ""
+    return {k: v for k, v in detail.items() if v is not None or k in ("transRef", "amount", "receiver_account", "sender_account")}
+
+
+def _slip_payload_payment_fields(slip_payload: dict | None) -> dict:
+    """ดึงฟิลด์สำหรับ Payment จาก body SlipOK (transRef, บัญชีผู้รับ/ผู้โอน, ฯลฯ)"""
+    tx = _extract_slip_transaction_dict(slip_payload)
+    if not tx:
+        return {}
+
+    recv_raw = str(tx.get("receiver_account") or "").strip()
+    send_raw = str(tx.get("sender_account") or "").strip()
+    bank_account = recv_raw or send_raw or ""
+
+    trans_ref = str(tx.get("transRef") or "")[:100]
+    detail = {
+        "transRef": tx.get("transRef"),
+        "amount": tx.get("amount"),
+        "paidLocalAmount": tx.get("paidLocalAmount"),
+        "transDate": tx.get("transDate"),
+        "transTime": tx.get("transTime"),
+        "receivingBank": tx.get("receivingBank"),
+        "sendingBank": tx.get("sendingBank"),
+        "receiver_displayName": tx.get("receiver_displayName"),
+        "receiver_account": tx.get("receiver_account"),
+        "sender_displayName": tx.get("sender_displayName"),
+        "sender_account": tx.get("sender_account"),
+        "language": tx.get("language"),
+        "slip_message": tx.get("slip_message") if tx.get("slip_message") is not None else tx.get("message"),
+    }
+    detail = {k: v for k, v in detail.items() if v is not None}
+    if detail:
+        logger.info(
+            "SlipOK parsed detail: %s",
+            json.dumps(detail, ensure_ascii=False)[:2000],
+        )
+
     return {
-        "transaction_id": tx,
-        "bank_account": str(recv_val)[:255],
-        "verification_notes": json.dumps(detail, ensure_ascii=False),
+        "transaction_id": trans_ref,
+        "bank_account": str(bank_account)[:255],
     }
 
 
@@ -1668,10 +1876,8 @@ def create_booking_and_payment(
 
     # สร้าง Payment record (+ รายละเอียดจากสลิป SlipOK ถ้ามี)
     slip_extra: dict = {}
-    slip_now = None
     if slip_ok_payload:
         slip_extra = _slip_payload_payment_fields(slip_ok_payload)
-        slip_now = tz.now()
 
     payment = Payment.objects.create(
         booking=booking,
@@ -1681,20 +1887,22 @@ def create_booking_and_payment(
         paid_at=tz.now(),
         transaction_id=slip_extra.get("transaction_id", ""),
         bank_account=slip_extra.get("bank_account", ""),
-        verification_notes=slip_extra.get("verification_notes", ""),
-        slip_uploaded_at=slip_now,
-        verified_at=slip_now,
     )
 
     if slip_image_bytes:
         from .supabase_storage import upload_payment_slip
 
-        pub, storage_path = upload_payment_slip(slip_image_bytes, payment.id)
+        pub, _path = upload_payment_slip(slip_image_bytes, payment.id)
         if pub:
-            payment.slip_public_url = pub
-            payment.slip_storage_path = storage_path or ""
-            payment.save(update_fields=["slip_public_url", "slip_storage_path"])
-            logger.info("Payment slip uploaded | payment=%s path=%s", payment.id, storage_path)
+            payment.payment_url = pub
+            payment.save(update_fields=["payment_url"])
+            logger.info("Payment slip stored | payment=%s url=%s", payment.id, (pub or "")[:160])
+        else:
+            logger.warning(
+                "Payment slip bytes present but payment_url not set | payment=%s — "
+                "configure SUPABASE_URL+SUPABASE_SERVICE_ROLE_KEY or PUBLIC_BACKEND_URL / LINE_CHANNEL_NGROK_BASE",
+                payment.id,
+            )
 
     # คำนวณวัน เวลา และระยะเวลา (เวอร์ชันไทย)
     start = trip.start_date
@@ -1733,6 +1941,13 @@ def create_booking_and_payment(
         f"✅ Booking+Payment created | LINE user: {line_user.display_name or line_user.line_user_id} | "
         f"Trip: {trip.name} | People: {person_count} | Total: {booking.total_price} | Duration: {trip_duration}"
     )
+
+    try:
+        from .booking_notifications import notify_booking_created
+
+        notify_booking_created(booking)
+    except Exception as e:
+        logger.exception("notify_booking_created failed: %s", e)
 
     return booking, payment, confirm_meta
 
@@ -1780,22 +1995,24 @@ def send_post_trip_feedback(line_user_id: str, trip_id: str, trip_name: str, boo
         like_payload += f":{booking_id}"
         dislike_payload += f":{booking_id}"
     
-    quick_reply = QuickReply(items=[
-        QuickReplyButton(
-            image_url="https://cdn-icons-png.flaticon.com/512/833/833472.png",
-            action=MessageAction(
-                label="👍 ประทับใจ",
-                text=like_payload
-            )
-        ),
-        QuickReplyButton(
-            image_url="https://cdn-icons-png.flaticon.com/512/833/833475.png",
-            action=MessageAction(
-                label="👎 ไม่ประทับใจ",
-                text=dislike_payload
-            )
-        )
-    ])
+    quick_reply = QuickReply(
+        items=[
+            QuickReplyButton(
+                action=PostbackAction(
+                    label="👍 ประทับใจ",
+                    data=like_payload,
+                    display_text="👍 ประทับใจ",
+                )
+            ),
+            QuickReplyButton(
+                action=PostbackAction(
+                    label="👎 ไม่ประทับใจ",
+                    data=dislike_payload,
+                    display_text="👎 ไม่ประทับใจ",
+                )
+            ),
+        ]
+    )
     
     message = TextSendMessage(text=text_content, quick_reply=quick_reply)
     

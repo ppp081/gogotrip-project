@@ -10,10 +10,24 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.AddField(
-            model_name='lineuser',
-            name='user_metadata',
-            field=models.JSONField(blank=True, default=dict),
+        # user_metadata อาจถูกสร้างไว้แล้วในฐานข้อมูล (manual / migration เก่า) — อย่า AddField ซ้ำ
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.AddField(
+                    model_name='lineuser',
+                    name='user_metadata',
+                    field=models.JSONField(blank=True, default=dict),
+                ),
+            ],
+            database_operations=[
+                migrations.RunSQL(
+                    sql=(
+                        "ALTER TABLE chat_lineuser "
+                        "ADD COLUMN IF NOT EXISTS user_metadata jsonb DEFAULT '{}'::jsonb;"
+                    ),
+                    reverse_sql=migrations.RunSQL.noop,
+                ),
+            ],
         ),
         migrations.AddField(
             model_name='payment',

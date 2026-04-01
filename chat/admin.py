@@ -6,6 +6,7 @@ from .models import (
     Payment,
     Equipment,
     BookingEquipment,
+    Notification,
     ChatbotSession,
     LineUser,
     LineMessage,
@@ -31,8 +32,8 @@ class AdminModelAdmin(admin.ModelAdmin):
 
 @admin.register(Trip)
 class TripAdmin(admin.ModelAdmin):
-    list_display = ['name', 'location', 'category', 'province', 'price_per_person', 'capacity', 'start_date', 'end_date']
-    list_filter = ['location', 'category', 'province', 'start_date']
+    list_display = ['name', 'is_active', 'location', 'category', 'province', 'price_per_person', 'capacity', 'start_date', 'end_date']
+    list_filter = ['is_active', 'location', 'category', 'province', 'start_date']
     search_fields = ['name', 'description', 'province']
     date_hierarchy = 'start_date'
 
@@ -45,8 +46,8 @@ class BookingAdmin(admin.ModelAdmin):
 
 @admin.register(Payment)
 class PaymentAdmin(admin.ModelAdmin):
-    list_display = ['booking', 'amount', 'payment_method', 'payment_status', 'slip_uploaded_at', 'verified_by', 'paid_at']
-    list_filter = ['payment_method', 'payment_status', 'slip_uploaded_at', 'verified_at']
+    list_display = ['booking', 'amount', 'payment_method', 'payment_status', 'payment_url', 'paid_at']
+    list_filter = ['payment_method', 'payment_status']
     search_fields = ['booking__trip__name', 'transaction_id']
     date_hierarchy = 'created_at'
     readonly_fields = ['created_at', 'updated_at']
@@ -59,6 +60,16 @@ class EquipmentAdmin(admin.ModelAdmin):
 @admin.register(BookingEquipment)
 class BookingEquipmentAdmin(admin.ModelAdmin):
     list_display = ['booking', 'equipment', 'quantity', 'total_price']
+
+
+@admin.register(Notification)
+class NotificationAdmin(admin.ModelAdmin):
+    list_display = ['id', 'booking', 'read_at', 'created_at']
+    list_filter = ['created_at']
+    search_fields = ['booking__trip__name', 'booking__customer__name']
+    readonly_fields = ['id', 'booking', 'payload', 'read_at', 'created_at']
+    date_hierarchy = 'created_at'
+
 
 @admin.register(ChatbotSession)
 class ChatbotSessionAdmin(admin.ModelAdmin):

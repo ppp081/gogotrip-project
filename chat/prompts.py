@@ -8,7 +8,10 @@ reply_language:
 - en = user message is purely English and user context isn't Thai.
 
 intent (use conversation history only to disambiguate):
-- admin_chat: trips, bookings, payments, prices, schedules, anything that needs tools/data.
+- cancel_chat: user wants to cancel a trip/booking, get a refund for a cancelled trip, or stop an upcoming booking.
+  Examples: "ยกเลิกทริป", "ขอยกเลิกการจอง", "เลิกทริป", "cancel my trip", "I want to cancel", "refund please".
+  Choose cancel_chat even if they also mention a trip name — cancellation intent overrides browsing.
+- admin_chat: trips, bookings (except pure cancellation), payments, prices, schedules, anything that needs tools/data.
 - friendly_chat: greetings, small talk, off-topic — unless history shows an active trip/booking thread.
 """
 
@@ -559,7 +562,6 @@ You have access to:
     - trip_province
     - trip_date
     - trip_price_per_person
-    - trip_total_price
     - trip_time
     - trip_image_url
     - booking_person_count
@@ -642,7 +644,6 @@ When responding, always output a valid JSON object with these keys:
         "trip_province": "trip_province",
         "trip_date": "Oct 16-17",
         "trip_price_per_person": "1,250.00",
-        "trip_total_price": "6,250.00",
         "trip_time": "10:00-10:30",
         "trip_image_url": "<trip_image_id>"
         "booking_person_count": "booking_person_count",

@@ -5,7 +5,7 @@ import httpx
 import json
 import logging
 from typing import Any, Dict, Literal
-from .models import Booking
+
 
 from pydantic import BaseModel, Field
 
@@ -196,8 +196,8 @@ class LLM_Response(BaseModel):
 
 
 class ClassifyRoute(BaseModel):
-    intent: Literal["admin_chat", "friendly_chat"] = Field(
-        description="admin_chat = trips/bookings/tools; friendly_chat = chit-chat"
+    intent: Literal["admin_chat", "friendly_chat", "cancel_chat"] = Field(
+        description="admin_chat = trips/bookings/tools; friendly_chat = chit-chat; cancel_chat = cancel/refund trip"
     )
     reply_language: Literal["th", "en"] = Field(
         description="th for Thai-heavy messages, en for English-heavy"
@@ -226,6 +226,44 @@ def classify_agent(user_text, history=None):
     except Exception:
         logger.exception("classify_agent structured output failed; using default route")
         return _DEFAULT_ROUTE.intent, _DEFAULT_ROUTE.reply_language
+
+
+def _cancel_chat_response(line_user, reply_language: str | None) -> Dict[str, Any]:
+    """
+    Auto reply for trip cancellation with staff contact information (TH/EN).
+    """
+    lang = (reply_language or "th").strip().lower()
+    if lang not in ("th", "en"):
+        lang = "th"
+
+    meta: Dict[str, Any] = {"intent": "cancel_chat", "reply_language": lang}
+
+    if lang == "en":
+        content = (
+            "TRIP CANCELLATION\n"
+            "We've received your request to cancel. Currently, our AI can't process cancellations directly for security reasons.\n\n"
+            "Please contact our support team to proceed with your request:\n\n"
+            "📞 Phone: 099-123-4567\n"
+            "✉️ Email: support@gogotrip.co.th\n"
+            "⏰ Hours: 09:00 - 18:00 (Daily)\n\n"
+            "Our staff will take care of you immediately. Hope to see you on another trip! 🌿"
+        )
+    else:
+        content = (
+            "แจ้งยกเลิกการจอง\n"
+            "ได้รับแจ้งความประสงค์แล้วครับ เพื่อความปลอดภัยของข้อมูลการจอง ระบบอัตโนมัติจะไม่สามารถยกเลิกได้โดยตรงครับ\n\n"
+            "รบกวนคุณลูกค้าติดต่อเจ้าหน้าที่เพื่อดำเนินการยกเลิก/คืนเงิน ได้ที่:\n\n"
+            "📞 โทร: 099-123-4567\n"
+            "✉️ อีเมล: support@gogotrip.co.th\n"
+            "⏰ เวลาทำการ: 09:00 - 18:00 น. (ทุกวัน)\n\n"
+            "เจ้าหน้าที่จะรีบดูแลให้เร็วที่สุดครับ หวังว่าจะได้ร่วมเดินทางกันอีกครั้งนะครับ! 🌿"
+        )
+
+    return {
+        "response_type": "text",
+        "response_content": content,
+        "response_meta": meta,
+    }
 
 
 # ---------------- Friendly Agent ----------------
@@ -323,6 +361,8 @@ def trip_detail_agent(trip_id: str):
         trip = Trip.objects.get(id=trip_id)
     except Trip.DoesNotExist:
         return "ไม่พบข้อมูลทริปนี้"
+    if not trip.is_active:
+        return "ไม่พบข้อมูลทริปนี้"
 
     message = f"""
 Trip name: {trip.name}
@@ -359,8 +399,11 @@ def classify_node(state: AgentState):
     return {"intent": intent, "reply_language": reply_language}
 
 def route_intent(state: AgentState):
-    if state.get("intent") == "admin_chat":
+    intent = state.get("intent")
+    if intent == "admin_chat":
         return "admin_chat"
+    if intent == "cancel_chat":
+        return "cancel_chat"
     return "friendly_chat"
 
 def friendly_node(state: AgentState):
@@ -394,6 +437,17 @@ def admin_node(state: AgentState):
     parsed["response_meta"] = meta
     return {"response": parsed}
 
+
+def cancel_node(state: AgentState):
+    print("DEBUG [Node]: Entering Cancel Chat (auto)")
+    resp = _cancel_chat_response(state.get("line_user"), state.get("reply_language"))
+    meta = resp.get("response_meta") if isinstance(resp.get("response_meta"), dict) else {}
+    meta["intent"] = "cancel_chat"
+    meta["reply_language"] = state.get("reply_language")
+    resp["response_meta"] = meta
+    return {"response": resp}
+
+
 def feedback_analysis_node(state: AgentState):
     return {"response": {
         "response_type": "feedback_analysis",
@@ -405,6 +459,7 @@ workflow = StateGraph(AgentState)
 workflow.add_node("classify", classify_node)
 workflow.add_node("friendly_chat", friendly_node)
 workflow.add_node("admin_chat", admin_node)
+workflow.add_node("cancel_chat", cancel_node)
 
 workflow.add_edge(START, "classify")
 workflow.add_conditional_edges(
@@ -413,10 +468,12 @@ workflow.add_conditional_edges(
     {
         "friendly_chat": "friendly_chat",
         "admin_chat": "admin_chat",
+        "cancel_chat": "cancel_chat",
     },
 )
 workflow.add_edge("friendly_chat", END)
 workflow.add_edge("admin_chat", END)
+workflow.add_edge("cancel_chat", END)
 
 app_workflow = workflow.compile()
 
@@ -452,8 +509,75 @@ def run_agent(user_text: str, history=None, line_user=None) -> Dict[str, Any]:
     result = app_workflow.invoke(initial_state)
     response = _unwrap_accidental_json_in_response_content(result["response"])
 
+    rm = response.get("response_meta") if isinstance(response.get("response_meta"), dict) else {}
+    print(f"📍 intent={rm.get('intent')}  reply_language={rm.get('reply_language')}")
+
     ai_response = response.get("response_content", "")
     print(f"💬 AI: {ai_response}")
     print(f"{'='*50}\n")
 
     return response
+
+
+# ---------------- Summary Generator ----------------
+
+def analyze_reviews():
+    from .models import Rating, Summary
+    import json
+    
+    ratings = list(Rating.objects.all())
+    total = len(ratings)
+    if total == 0:
+        return Summary.objects.create()
+
+    avg = sum(r.service_rating for r in ratings) / total
+    
+    counts = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
+    for r in ratings:
+        if 1 <= r.service_rating <= 5:
+            counts[r.service_rating] += 1
+            
+    stats = []
+    for star in [5, 4, 3, 2, 1]:
+        cnt = counts[star]
+        stats.append({
+            "stars": star,
+            "count": cnt,
+            "percentage": round(cnt / total * 100) if total else 0
+        })
+        
+    pos = sum(1 for r in ratings if r.service_rating >= 4)
+    neu = sum(1 for r in ratings if r.service_rating == 3)
+    neg = sum(1 for r in ratings if r.service_rating <= 2)
+    
+    comments = [r.comment for r in ratings if r.comment and r.comment.strip()][:50]
+    data = {"issues": [], "suggestion": "พยายามรักษามาตรฐานบริการอย่างต่อเนื่อง", "faqs": []}
+    
+    if comments:
+        text_feed = "\n".join(f"- {c}" for c in comments)
+        try:
+            resp = llm_fast.invoke([
+                {"role": "system", "content": "You are a customer feedback analyzer. Analyze the given comments in Thai. Output exactly valid JSON with keys: 'issues'[array of {title, description, severity(critical/warning), mentions(int)}], 'suggestion'(str), and 'faqs'[array of {question, answer}]."},
+                {"role": "user", "content": f"Comments:\n{text_feed}"}
+            ])
+            extracted = json.loads(_strip_json_code_fence(resp.content))
+            data["issues"] = extracted.get("issues", [])
+            data["suggestion"] = extracted.get("suggestion", "")
+            data["faqs"] = extracted.get("faqs", [])
+        except Exception as e:
+            logger.error(f"LLM parse error: {e}")
+
+    return Summary.objects.create(
+        total_reviews=total,
+        average_rating=round(avg, 2),
+        ratings_stats=stats,
+        positive_count=pos,
+        positive_percentage=round(pos / total * 100),
+        neutral_count=neu,
+        neutral_percentage=round(neu / total * 100),
+        negative_count=neg,
+        negative_percentage=round(neg / total * 100),
+        issues=data.get("issues", []),
+        suggestion=data.get("suggestion", ""),
+        faqs=data.get("faqs", [])
+    )

@@ -18,6 +18,7 @@ from .models import (
     BookingEquipment,
     Rating,
     Summary,
+    Notification,
 )
 
 class LineUserSerializer(serializers.ModelSerializer):
@@ -106,7 +107,6 @@ class ImageSerializer(serializers.ModelSerializer):
 
 
 class TripSerializer(serializers.ModelSerializer):
-    created_by_name = serializers.CharField(source='created_by.name', read_only=True)
     category_label = serializers.CharField(source='get_category_display', read_only=True)
     thumbnail_image = serializers.SerializerMethodField()
     images = ImageSerializer(many=True, read_only=True)
@@ -117,7 +117,7 @@ class TripSerializer(serializers.ModelSerializer):
             'id', 'name', 'description', 'content', 'location', 'province', 'country',
             'price_per_person', 'capacity', 'start_date', 'end_date',
             'category', 'category_label',
-            'created_by', 'created_by_name',
+            'is_active',
             'thumbnail_image', 'images', 'created_at'
         ]
 
@@ -131,26 +131,41 @@ class TripSerializer(serializers.ModelSerializer):
 
 class BookingSerializer(serializers.ModelSerializer):
     trip_name = serializers.CharField(source='trip.name', read_only=True)
+    trip_province = serializers.CharField(source='trip.province', read_only=True)
     customer_name = serializers.CharField(source='customer.name', read_only=True)
-    
+    customer_phone = serializers.CharField(source='customer.phone', read_only=True)
+    line_display = serializers.SerializerMethodField()
+
     class Meta:
         model = Booking
         fields = [
-            'id', 'trip', 'trip_name', 'customer', 'customer_name',
-            'group_size', 'total_price', 'status', 'created_at'
+            'id', 'trip', 'trip_name', 'trip_province', 'customer', 'customer_name',
+            'customer_phone', 'line_display',
+            'group_size', 'total_price', 'status', 'created_at',
         ]
-        read_only_fields = ['id', 'created_at', 'trip_name', 'customer_name']
+        read_only_fields = [
+            'id', 'created_at', 'trip_name', 'trip_province', 'customer_name',
+            'customer_phone', 'line_display',
+        ]
+
+    def get_line_display(self, obj):
+        cust = getattr(obj, "customer", None)
+        if not cust:
+            return None
+        first = cust.line_accounts.first()
+        if not first:
+            return None
+        name = (first.display_name or "").strip()
+        return name or str(first.line_user_id)
 
 class PaymentSerializer(serializers.ModelSerializer):
     booking_info = BookingSerializer(source='booking', read_only=True)
-    verified_by_name = serializers.CharField(source='verified_by.name', read_only=True)
-    
+
     class Meta:
         model = Payment
         fields = [
             'id', 'booking', 'booking_info', 'amount', 'payment_method',
-            'payment_status', 'slip_image', 'slip_uploaded_at', 
-            'verified_by', 'verified_by_name', 'verified_at', 'verification_notes',
+            'payment_status', 'payment_url',
             'transaction_id', 'bank_account', 'paid_at', 'created_at', 'updated_at'
         ]
 
@@ -173,9 +188,35 @@ class RatingSerializer(serializers.ModelSerializer):
         model = Rating
         fields = [
             'id', 'trip', 'user', 'user_name', 'booking_id',
-            'trip_rating', 'service_rating', 'comment', 'created_at'
+            'service_rating', 'comment', 'created_at'
         ]
         read_only_fields = ['id', 'created_at', 'user_name']
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    """ข้อมูลจริงจาก DB (Booking → Trip / User) — payload เป็น snapshot เสริม"""
+
+    trip_name = serializers.CharField(source='booking.trip.name', read_only=True)
+    trip_province = serializers.CharField(source='booking.trip.province', read_only=True)
+    customer_name = serializers.CharField(source='booking.customer.name', read_only=True)
+    booking_status = serializers.CharField(source='booking.status', read_only=True)
+    booking_total = serializers.DecimalField(
+        source='booking.total_price', max_digits=12, decimal_places=2, read_only=True
+    )
+    group_size = serializers.IntegerField(source='booking.group_size', read_only=True)
+    read = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Notification
+        fields = [
+            'id', 'booking', 'payload', 'read_at', 'created_at', 'read',
+            'trip_name', 'trip_province', 'customer_name', 'booking_status',
+            'booking_total', 'group_size',
+        ]
+        read_only_fields = fields
+
+    def get_read(self, obj):
+        return obj.read_at is not None
 
 
 class SummarySerializer(serializers.ModelSerializer):
@@ -185,7 +226,7 @@ class SummarySerializer(serializers.ModelSerializer):
         model = Summary
         fields = [
             'id', 'total_reviews', 'average_rating',
-            'sentiment', 'issues', 'suggestion', 'faqs', 'created_at',
+            'sentiment', 'issues', 'suggestion', 'faqs', 'ratings_stats', 'created_at',
         ]
         read_only_fields = fields
 
