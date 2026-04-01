@@ -1,6 +1,38 @@
+import { useEffect, useState } from "react"
+import { Navigate } from "react-router-dom"
 import { LoginForm } from "@/components/login-form"
+import { meRequest } from "@/api/auth"
 
 export default function LoginPage() {
+  const [checking, setChecking] = useState(true)
+  const [alreadyStaff, setAlreadyStaff] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    meRequest()
+      .then((d) => {
+        if (cancelled) return
+        if (d.authenticated && d.user?.is_staff) setAlreadyStaff(true)
+      })
+      .finally(() => {
+        if (!cancelled) setChecking(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  if (checking) {
+    return (
+      <div className="grid min-h-svh min-w-screen place-items-center text-slate-600">
+        กำลังโหลด…
+      </div>
+    )
+  }
+  if (alreadyStaff) {
+    return <Navigate to="/dashboard" replace />
+  }
+
   return (
     <div className="grid min-h-svh min-w-screen lg:grid-cols-2">
         <div className="flex flex-col gap-4 p-6 md:p-10">

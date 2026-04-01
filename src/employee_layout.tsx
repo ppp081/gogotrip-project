@@ -1,17 +1,18 @@
 // src/employee_layout.tsx
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   LayoutDashboard,
-  LucideIcon,
+  Sparkles,
   User,
   Map,
   Menu,
   Users,
   CalendarCheck,
-  Bell,
   X,
 } from "lucide-react";
-import { Link, Outlet, useLocation } from "react-router-dom";
+import type { LucideIcon } from "lucide-react";
+import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { logoutRequest } from "@/api/auth";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -21,20 +22,38 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  NOTIFICATION_EVENT,
-  type NotificationPayload,
-} from "@/lib/notification-bus";
+import { useEmployeeNotifications } from "@/hooks/useEmployeeNotifications";
+import { cn } from "@/lib/utils";
 
-type NotificationItem = {
-  id: string;
-  title: string;
-  message: string;
-  type: NotificationPayload["type"];
-  createdAt: string;
-  read: boolean;
-  link?: string;
-};
+/** กระดิ่ง SVG (ไม่ใช้ emoji) — สีตาม hasUnread */
+function HeaderBellIcon({
+  className,
+  hasUnread,
+}: {
+  className?: string;
+  hasUnread: boolean;
+}) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={cn(
+        "h-5 w-5 shrink-0 transition-colors",
+        hasUnread ? "text-slate-900" : "text-slate-400",
+        className,
+      )}
+      aria-hidden
+    >
+      <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+      <path d="M10.29 21c.31.97 1.2 1.67 2.21 1.67 1.01 0 1.9-.7 2.21-1.67" />
+    </svg>
+  );
+}
 
 export type EmployeeSection = {
   key: string;
@@ -52,6 +71,7 @@ const FALLBACK_SECTIONS: EmployeeSection[] = [
   { key: "trips", label: "จัดการทริป", icon: Map, path: "/trips" },
   { key: "bookings", label: "การจองลูกค้า", icon: CalendarCheck, path: "/bookings" },
   { key: "customers", label: "ข้อมูลลูกค้า", icon: Users, path: "/customers" },
+  { key: "ai-summary", label: "AI Insight", icon: Sparkles, path: "/summary" },
 ];
 
 const isPathActive = (currentPath: string, targetPath: string) => {
@@ -62,9 +82,18 @@ const isPathActive = (currentPath: string, targetPath: string) => {
 };
 
 export default function EmployeeLayout({ sections }: EmployeeLayoutProps) {
+  const navigate = useNavigate();
   const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const {
+    items: notifications,
+    loading: notificationsLoading,
+    fetchError,
+    unreadCount,
+    markAllRead,
+    bellAriaLabel,
+    refetch: refetchNotifications,
+  } = useEmployeeNotifications();
 
   const navItems = useMemo<EmployeeSection[]>(
     () => (sections && sections.length > 0 ? sections : FALLBACK_SECTIONS),
@@ -75,53 +104,6 @@ export default function EmployeeLayout({ sections }: EmployeeLayoutProps) {
     () => navItems.find((item) => isPathActive(location.pathname, item.path)),
     [location.pathname, navItems],
   );
-
-  const activeLabel = activeSection?.label ?? "Dashboard";
-  const unreadCount = notifications.filter((notification) => !notification.read).length;
-
-  useEffect(() => {
-    const handleNotification = (event: Event) => {
-      const customEvent = event as CustomEvent<NotificationPayload>;
-      if (!customEvent.detail) {
-        return;
-      }
-
-      const detail = customEvent.detail;
-      const id = detail.id ?? crypto.randomUUID?.() ?? String(Date.now());
-      const createdAt = detail.createdAt ?? new Date().toISOString();
-      const type = detail.type ?? "info";
-
-      setNotifications((prev) => {
-        const next: NotificationItem[] = [
-          {
-            id,
-            title: detail.title ?? (type === "booking" ? "การจองใหม่" : "การแจ้งเตือน"),
-            message: detail.message,
-            type,
-            createdAt,
-            read: false,
-            link: detail.link,
-          },
-          ...prev,
-        ];
-
-        return next.slice(0, 20);
-      });
-    };
-
-    window.addEventListener(NOTIFICATION_EVENT, handleNotification as EventListener);
-    return () => {
-      window.removeEventListener(NOTIFICATION_EVENT, handleNotification as EventListener);
-    };
-  }, []);
-
-  const markAllAsRead = useCallback(() => {
-    setNotifications((prev) => prev.map((notification) => ({ ...notification, read: true })));
-  }, []);
-
-  const clearNotifications = useCallback(() => {
-    setNotifications([]);
-  }, []);
 
   const formatNotificationTime = useCallback((iso: string) => {
     const date = new Date(iso);
@@ -145,9 +127,8 @@ export default function EmployeeLayout({ sections }: EmployeeLayoutProps) {
       ) : null}
 
       <aside
-        className={`fixed inset-y-0 left-0 z-40 w-64 transform bg-white p-6 shadow-lg transition-transform duration-200 ease-in-out md:static md:h-auto md:translate-x-0 md:shadow-none ${
-          sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
-        }`}
+        className={`fixed inset-y-0 left-0 z-40 w-64 transform bg-white p-6 shadow-lg transition-transform duration-200 ease-in-out md:static md:h-auto md:translate-x-0 md:shadow-none ${sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
+          }`}
       >
         <div className="flex items-center justify-between">
           <div className="text-blue-600">
@@ -173,17 +154,15 @@ export default function EmployeeLayout({ sections }: EmployeeLayoutProps) {
                 key={item.key}
                 to={item.path}
                 onClick={() => setSidebarOpen(false)}
-                className={`group flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-medium transition-colors ${
-                  isActive
-                    ? "bg-[#2563EB] text-white shadow-md"
-                    : "text-[#4F6FB3] hover:bg-[#EEF3FF] hover:text-[#1E3A8A]"
-                }`}
+                className={`group flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-medium transition-colors ${isActive
+                  ? "bg-[#2563EB] text-white shadow-md"
+                  : "text-[#4F6FB3] hover:bg-[#EEF3FF] hover:text-[#1E3A8A]"
+                  }`}
                 aria-current={isActive ? "page" : undefined}
               >
                 <Icon
-                  className={`h-5 w-5 transition-colors ${
-                    isActive ? "text-white" : "text-[#4F6FB3] group-hover:text-[#1E3A8A]"
-                  }`}
+                  className={`h-5 w-5 transition-colors ${isActive ? "text-white" : "text-[#4F6FB3] group-hover:text-[#1E3A8A]"
+                    }`}
                 />
                 <span>{item.label}</span>
               </Link>
@@ -203,21 +182,37 @@ export default function EmployeeLayout({ sections }: EmployeeLayoutProps) {
           >
             <Menu className="h-5 w-5" />
           </Button>
-          <div className="ml-auto flex items-center gap-4">
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-2 sm:gap-4">
+            {fetchError ? (
+              <p
+                className="order-2 max-w-[min(100%,220px)] text-right text-xs leading-snug text-rose-600 sm:order-1"
+                role="status"
+              >
+                {fetchError}
+              </p>
+            ) : null}
+            <div className="order-1 flex items-center gap-2 sm:order-2 sm:gap-4">
             <DropdownMenu
               onOpenChange={(open) => {
                 if (open) {
-                  markAllAsRead();
+                  void markAllRead();
                 }
               }}
             >
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  className="relative rounded-full p-2 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900"
-                  aria-label="การแจ้งเตือน"
+                  disabled={notificationsLoading}
+                  className={cn(
+                    "relative rounded-full p-2 transition-colors hover:bg-slate-100",
+                    unreadCount > 0
+                      ? "text-slate-900 ring-2 ring-blue-100"
+                      : "text-slate-500 hover:text-slate-900",
+                    notificationsLoading && "opacity-60",
+                  )}
+                  aria-label={bellAriaLabel}
                 >
-                  <Bell className="h-5 w-5" />
+                  <HeaderBellIcon hasUnread={unreadCount > 0} />
                   {unreadCount > 0 ? (
                     <span className="absolute right-1 top-1 inline-flex min-h-[1.25rem] min-w-[1.25rem] -translate-y-1/2 translate-x-1/2 items-center justify-center rounded-full bg-rose-500 px-1 text-[0.65rem] font-semibold text-white">
                       {unreadCount > 9 ? "9+" : unreadCount}
@@ -235,72 +230,108 @@ export default function EmployeeLayout({ sections }: EmployeeLayoutProps) {
                       onClick={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
-                        clearNotifications();
+                        void markAllRead();
                       }}
                     >
-                      ล้างทั้งหมด
+                      ทำเครื่องหมายอ่านทั้งหมด
                     </button>
                   ) : null}
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                {notifications.length === 0 ? (
+                {notificationsLoading && notifications.length === 0 ? (
+                  <div className="px-4 py-8 text-center text-sm text-slate-500">
+                    กำลังโหลด…
+                  </div>
+                ) : notifications.length === 0 ? (
                   <div className="px-4 py-8 text-center text-sm text-slate-500">
                     ยังไม่มีการแจ้งเตือน
                   </div>
                 ) : (
                   <div className="max-h-72 overflow-y-auto">
                     {notifications.map((notification) => (
-                      <DropdownMenuItem
-                        key={notification.id}
-                        className="flex cursor-default items-start gap-2 px-4 py-3 text-left focus:bg-slate-100"
-                        onSelect={(event) => event.preventDefault()}
-                      >
-                        <div className="flex-1">
-                          <p className="text-xs font-semibold text-slate-700">
-                            {notification.title}
-                          </p>
-                          <p className="mt-1 text-sm text-slate-600">
-                            {notification.message}
-                          </p>
-                          <p className="mt-1 text-xs text-slate-400">
-                            {formatNotificationTime(notification.createdAt)}
-                          </p>
-                        </div>
-                      </DropdownMenuItem>
-                    ))}
+                        <DropdownMenuItem
+                          key={notification.id}
+                          className={`flex cursor-default items-start gap-3 px-4 py-3 text-left focus:bg-slate-100 ${
+                            !notification.read ? "bg-slate-50" : ""
+                          }`}
+                          onSelect={(event) => event.preventDefault()}
+                        >
+                          <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-50 text-emerald-500">
+                            <CalendarCheck className="h-4 w-4" />
+                          </div>
+                          <div className="flex-1 space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <p
+                                className={`text-sm font-semibold ${
+                                  !notification.read ? "text-slate-900" : "text-slate-600"
+                                }`}
+                              >
+                                {notification.title}
+                              </p>
+                              {!notification.read && (
+                                <span className="h-2 w-2 shrink-0 rounded-full bg-blue-600" />
+                              )}
+                            </div>
+                            <p className="text-xs font-medium text-slate-700">
+                              {notification.tripName}
+                              {notification.tripProvince
+                                ? ` · ${notification.tripProvince}`
+                                : ""}
+                            </p>
+                            <p className="text-xs text-slate-500 line-clamp-2">
+                              {notification.detailLine}
+                            </p>
+                            <p className="text-[10px] text-slate-400">
+                              {formatNotificationTime(notification.createdAt)}
+                            </p>
+                          </div>
+                        </DropdownMenuItem>
+                      ))}
                   </div>
                 )}
+                {fetchError ? (
+                  <div className="border-t border-slate-100 px-4 py-2">
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-blue-600 hover:text-blue-500"
+                      onClick={() => void refetchNotifications()}
+                    >
+                      ลองโหลดใหม่
+                    </button>
+                  </div>
+                ) : null}
               </DropdownMenuContent>
             </DropdownMenu>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  className="flex items-center gap-2 rounded-full bg-slate-200  p-2 text-sm font-medium text-slate-600 transition-colors hover:bg-slate-300"
+                  className="flex items-center gap-2 rounded-full bg-slate-200 p-2 text-sm font-medium text-slate-600 transition-colors hover:bg-slate-300"
                   aria-label="บัญชีผู้ใช้"
                 >
                   <User className="size-5" />
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-48 py-2">
-                <div className="px-3 pb-2 text-sm font-semibold text-slate-900">
+                <DropdownMenuLabel className="text-sm font-semibold text-slate-900">
                   บัญชีผู้ใช้
-                </div>
-                <DropdownMenuItem onSelect={() => {}}>
-                  โปรไฟล์
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => {}}>
-                  การตั้งค่า
-                </DropdownMenuItem>
+                </DropdownMenuLabel>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   className="text-rose-600 focus:text-rose-600"
-                  onSelect={() => {}}
+                  onSelect={async () => {
+                    try {
+                      await logoutRequest();
+                    } finally {
+                      navigate("/signin", { replace: true });
+                    }
+                  }}
                 >
                   ออกจากระบบ
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
+            </div>
           </div>
         </header>
 

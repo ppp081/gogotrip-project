@@ -28,6 +28,7 @@ export type BookingRecord = {
   payment: PaymentDetails;
   traveler: string;
   lineId: string;
+  addOns?: string[];
 };
 
 export const currencyFormatter = new Intl.NumberFormat("th-TH", {
@@ -48,6 +49,7 @@ export const BOOKING_DATA: BookingRecord[] = [
     status: "pending",
     traveler: "สุพจน์ ศรีใจ",
     lineId: "@supoj.trip",
+    addOns: ["เต็นท์"],
     payment: {
       method: "Credit Card",
       brand: "VISA",
@@ -120,6 +122,7 @@ export const BOOKING_DATA: BookingRecord[] = [
     status: "success",
     traveler: "ศุภชัย ดวงดี",
     lineId: "@supachai.hike",
+    addOns: ["เต็นท์", "ถุงนอน", "เสื้อกันฝน"],
     payment: {
       method: "Credit Card",
       brand: "Mastercard",
@@ -213,6 +216,7 @@ export const BOOKING_DATA: BookingRecord[] = [
     status: "success",
     traveler: "ภัทรวดี โชติรัตน์",
     lineId: "@patrawadee.ski",
+    addOns: ["เต็นท์"],
     payment: {
       method: "Credit Card",
       brand: "VISA",

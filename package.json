@@ -3,11 +3,16 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "packageManager": "bun@1.2.19",
   "scripts": {
-    "dev": "vite --host",
+    "dev": "bunx vite --host",
+    "dev:turbo": "turbo run dev",
     "build": "vite build",
+    "build:turbo": "turbo run build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "lint:turbo": "turbo run lint",
+    "preview": "vite preview",
+    "preview:turbo": "turbo run preview"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.1.1",
@@ -76,6 +81,7 @@
     "eslint-plugin-react-refresh": "^0.4.20",
     "globals": "^16.3.0",
     "react-router-dom": "^7.7.0",
+    "turbo": "^2.8.20",
     "tw-animate-css": "^1.3.5",
     "typescript": "~5.8.3",
     "typescript-eslint": "^8.35.1",

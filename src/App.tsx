@@ -1,7 +1,7 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Home from "./pages/Home";
 import EmployeeDashboard from "./pages/EmployeeDashboard";
-import Summary from "./pages/Summary";
+import Summary from "./pages/Trip_Summary";
 import MainLayout from "@/layout";
 import EmployeeLayout from "@/employee_layout";
 import Customers from "./pages/Customers";
@@ -16,20 +16,23 @@ import Bookings from "./pages/Bookings";
 import TripDetail from "./pages/Trip_Detail";
 import BookingDetail from "@/pages/BookingDetail";
 import CustomerDetail from "@/pages/CustomerDetail";
+import RequireStaff from "@/components/RequireStaff";
 
 function App() {
   return (
     <BrowserRouter>
       <Routes>
-        <Route element={<EmployeeLayout />}>
-          <Route path="/dashboard" element={<EmployeeDashboard />} />
-          <Route path="/summary" element={<Summary />} />
-          <Route path="/trips" element={<Trips />} />
-          <Route path="/trips/:tripId" element={<TripDetail />} />
-          <Route path="/customers" element={<Customers />} />
-          <Route path="/customers/:customerId" element={<CustomerDetail />} />
-          <Route path="/bookings" element={<Bookings />} />
-          <Route path="/bookings/:bookingId" element={<BookingDetail />} />
+        <Route element={<RequireStaff />}>
+          <Route element={<EmployeeLayout />}>
+            <Route path="/dashboard" element={<EmployeeDashboard />} />
+            <Route path="/summary" element={<Summary />} />
+            <Route path="/trips" element={<Trips />} />
+            <Route path="/trips/:tripId" element={<TripDetail />} />
+            <Route path="/customers" element={<Customers />} />
+            <Route path="/customers/:customerId" element={<CustomerDetail />} />
+            <Route path="/bookings" element={<Bookings />} />
+            <Route path="/bookings/:bookingId" element={<BookingDetail />} />
+          </Route>
         </Route>
 
         <Route element={<MainLayout />}>

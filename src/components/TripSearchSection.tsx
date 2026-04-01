@@ -1,9 +1,9 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useMemo } from "react"
 import { Input } from "@/components/ui/input"
 import { motion, AnimatePresence } from "framer-motion"
-import { Search, ChevronLeft, ChevronRight, Clock, Users } from "lucide-react"
+import { Search, ChevronLeft, ChevronRight } from "lucide-react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import useDebounce from "@/hooks/use-debounce"
@@ -16,12 +16,25 @@ interface Props {
   // CATEGORY_NAME: Record<string, string>
 }
 
+/** แสดงเฉพาะทริปที่เปิดใช้งานและยังไม่ถึงวันเริ่มเดินทาง */
+function isListableOnHomepage(t: Trip): boolean {
+  if (t.is_active === false) return false
+  if (!t.start_date) return false
+  const start = new Date(t.start_date).getTime()
+  if (!Number.isFinite(start)) return false
+  return start > Date.now()
+}
+
 export default function TripSearchSection({ trips }: Props) {
   const [query, setQuery] = useState("")
-  const [filteredTrips, setFilteredTrips] = useState<Trip[]>(trips)
-  const [isFocused, setIsFocused] = useState(false)
+  const [filteredTrips, setFilteredTrips] = useState<Trip[]>([])
   const debouncedQuery = useDebounce(query, 250)
   const destRef = useRef<HTMLDivElement | null>(null)
+
+  const listableTrips = useMemo(
+    () => trips.filter(isListableOnHomepage),
+    [trips],
+  )
 
   const scrollDest = (dir: "left" | "right") => {
     const el = destRef.current
@@ -32,13 +45,15 @@ export default function TripSearchSection({ trips }: Props) {
 
   useEffect(() => {
     if (!debouncedQuery.trim()) {
-      setFilteredTrips(trips)
+      setFilteredTrips(listableTrips)
     } else {
       const normalized = debouncedQuery.toLowerCase().trim()
-      const filtered = trips.filter((t) => t.name.toLowerCase().includes(normalized))
+      const filtered = listableTrips.filter((t) =>
+        t.name.toLowerCase().includes(normalized),
+      )
       setFilteredTrips(filtered)
     }
-  }, [debouncedQuery, trips])
+  }, [debouncedQuery, listableTrips])
 
   return (
     <motion.section
@@ -69,8 +84,6 @@ export default function TripSearchSection({ trips }: Props) {
               placeholder="ค้นหาทริป เช่น เขาใหญ่ เชียงใหม่..."
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              onFocus={() => setIsFocused(true)}
-              onBlur={() => setTimeout(() => setIsFocused(false), 150)}
               className="pl-4 pr-10 py-3 h-16 rounded-full border border-gray-300 focus:ring-2 focus:ring-indigo-500"
             />
             <div className="absolute right-0 top-1/2 -translate-y-1/2 border border-gray-300 shadow-2xl  p-1.5 rounded-full cursor-pointer hover:bg-input/30 transition">
@@ -119,7 +132,7 @@ export default function TripSearchSection({ trips }: Props) {
                         <CardContent className="p-0">
                           <div className="relative aspect-video overflow-hidden">
                             <img
-                              src={item.thumbnail_image}
+                              src={item.thumbnail_image ?? undefined}
                               alt={item.name}
                               className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-110"
                             />

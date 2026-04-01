@@ -4,11 +4,11 @@ import {
   ArrowRight,
   ChevronDown,
   DollarSign,
+  Loader2,
   MapPin,
   MessageSquare,
   Sparkles,
   Star,
-  TrendingUp,
   Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -51,8 +51,9 @@ import {
   emitNotification,
 } from "@/lib/notification-bus";
 import { Link } from "react-router-dom";
+import { apiFetch } from "@/api/client";
 
-type RangeKey = "weekly" | "monthly" | "yearly";
+type RangeKey = "monthly" | "yearly";
 
 interface RevenueDatum {
   name: string;
@@ -66,15 +67,17 @@ interface RoomDatum {
   available: number;
 }
 
-interface Trip {
-  id: number;
+interface TopTrip {
+  id: string;
   name: string;
   bookings: number;
+  travelers: number;
   revenue: number;
+  image: string | null;
 }
 
 interface RecentBooking {
-  id: number;
+  id: number | string;
   customerName: string;
   trip: string;
   people: number;
@@ -83,166 +86,25 @@ interface RecentBooking {
   bookingDate: string;
 }
 
+type DashboardData = {
+  activeTripsCount: number;
+  totalBookingsCount: number;
+  totalRevenue: number;
+  topTrips: TopTrip[];
+  recentBookings: RecentBooking[];
+  chatbotInsights: {
+    totalConversations: number;
+    commonQuestions: { question: string; count: number }[];
+    satisfaction: number;
+  };
+  revenueSeries: Record<RangeKey, RevenueDatum[]>;
+  guestSeries: Record<RangeKey, RevenueDatum[]>;
+  roomSeries: Record<RangeKey, RoomDatum[]>;
+};
+
 const RANGE_LABEL: Record<RangeKey, string> = {
-  weekly: "รายสัปดาห์",
   monthly: "รายเดือน",
   yearly: "รายปี",
-};
-
-const REVENUE_SERIES: Record<RangeKey, RevenueDatum[]> = {
-  weekly: [
-    { name: "จ.", value: 42 },
-    { name: "อ.", value: 58 },
-    { name: "พ.", value: 65 },
-    { name: "พฤ.", value: 52 },
-    { name: "ศ.", value: 48 },
-    { name: "ส.", value: 61 },
-    { name: "อา.", value: 70 },
-  ],
-  monthly: [
-    { name: "ม.ค.", value: 410 },
-    { name: "ก.พ.", value: 432 },
-    { name: "มี.ค.", value: 458 },
-    { name: "เม.ย.", value: 447 },
-    { name: "พ.ค.", value: 472 },
-    { name: "มิ.ย.", value: 489 },
-    { name: "ก.ค.", value: 501 },
-    { name: "ส.ค.", value: 518 },
-    { name: "ก.ย.", value: 505 },
-    { name: "ต.ค.", value: 523 },
-    { name: "พ.ย.", value: 537 },
-    { name: "ธ.ค.", value: 552 },
-  ],
-  yearly: [
-    { name: "2021", value: 5100 },
-    { name: "2022", value: 5450 },
-    { name: "2023", value: 5875 },
-    { name: "2024", value: 6120 },
-    { name: "2025", value: 6540 },
-  ],
-};
-
-const GUEST_SERIES: Record<RangeKey, RevenueDatum[]> = {
-  weekly: [
-    { name: "จ.", value: 45 },
-    { name: "อ.", value: 52 },
-    { name: "พ.", value: 68 },
-    { name: "พฤ.", value: 58 },
-    { name: "ศ.", value: 48 },
-    { name: "ส.", value: 41 },
-    { name: "อา.", value: 36 },
-  ],
-  monthly: [
-    { name: "ม.ค.", value: 280 },
-    { name: "ก.พ.", value: 265 },
-    { name: "มี.ค.", value: 315 },
-    { name: "เม.ย.", value: 298 },
-    { name: "พ.ค.", value: 332 },
-    { name: "มิ.ย.", value: 347 },
-    { name: "ก.ค.", value: 352 },
-    { name: "ส.ค.", value: 368 },
-    { name: "ก.ย.", value: 341 },
-    { name: "ต.ค.", value: 355 },
-    { name: "พ.ย.", value: 362 },
-    { name: "ธ.ค.", value: 376 },
-  ],
-  yearly: [
-    { name: "2021", value: 3620 },
-    { name: "2022", value: 3890 },
-    { name: "2023", value: 4215 },
-    { name: "2024", value: 4570 },
-  ],
-};
-
-const ROOM_SERIES: Record<RangeKey, RoomDatum[]> = {
-  weekly: [
-    { name: "จ.", occupied: 18, booked: 15, available: 17 },
-    { name: "อ.", occupied: 22, booked: 12, available: 16 },
-    { name: "พ.", occupied: 20, booked: 14, available: 16 },
-    { name: "พฤ.", occupied: 19, booked: 10, available: 21 },
-    { name: "ศ.", occupied: 25, booked: 11, available: 14 },
-    { name: "ส.", occupied: 17, booked: 13, available: 20 },
-    { name: "อา.", occupied: 23, booked: 12, available: 15 },
-  ],
-  monthly: [
-    { name: "ม.ค.", occupied: 520, booked: 180, available: 70 },
-    { name: "ก.พ.", occupied: 485, booked: 165, available: 90 },
-    { name: "มี.ค.", occupied: 498, booked: 174, available: 68 },
-    { name: "เม.ย.", occupied: 472, booked: 188, available: 80 },
-    { name: "พ.ค.", occupied: 510, booked: 195, available: 75 },
-    { name: "มิ.ย.", occupied: 534, booked: 202, available: 64 },
-    { name: "ก.ค.", occupied: 546, booked: 208, available: 58 },
-    { name: "ส.ค.", occupied: 559, booked: 214, available: 52 },
-    { name: "ก.ย.", occupied: 541, booked: 207, available: 63 },
-    { name: "ต.ค.", occupied: 553, booked: 213, available: 60 },
-    { name: "พ.ย.", occupied: 567, booked: 219, available: 55 },
-    { name: "ธ.ค.", occupied: 580, booked: 226, available: 49 },
-  ],
-  yearly: [
-    { name: "2021", occupied: 6120, booked: 2150, available: 930 },
-    { name: "2022", occupied: 6395, booked: 2285, available: 890 },
-    { name: "2023", occupied: 6670, booked: 2410, available: 840 },
-    { name: "2024", occupied: 7055, booked: 2555, available: 780 },
-  ],
-};
-
-const topTrips: Trip[] = [
-  { id: 1, name: "ทริปเดินป่าระยะไกลคลองยัน", bookings: 45, revenue: 225_000 },
-  { id: 2, name: "เส้นทางกาแฟเชียงราย", bookings: 38, revenue: 190_000 },
-  { id: 3, name: "ผจญภัยเขาใหญ่", bookings: 32, revenue: 128_000 },
-  { id: 4, name: "ดอยอินทนนท์ ล่าหมอก", bookings: 28, revenue: 168_000 },
-  { id: 5, name: "ทะเลหมอกภูทับเบิก", bookings: 25, revenue: 150_000 },
-];
-
-const INITIAL_RECENT_BOOKINGS: RecentBooking[] = [
-  {
-    id: 1,
-    customerName: "สุพจน์ ศรีใจ",
-    trip: "เชียงใหม่ ฟู้ดทัวร์หนึ่งวัน",
-    people: 2,
-    paymentStatus: "Paid",
-    amount: 5200,
-    bookingDate: "2024-01-15",
-  },
-  {
-    id: 2,
-    customerName: "กมลทิพย์ ทองดี",
-    trip: "ทริปเดินป่าระยะไกลคลองยัน",
-    people: 4,
-    paymentStatus: "Pending",
-    amount: 11800,
-    bookingDate: "2024-01-14",
-  },
-  {
-    id: 3,
-    customerName: "ปิยวลี สิงหเดช",
-    trip: "เดินป่าเขาใหญ่",
-    people: 1,
-    paymentStatus: "Paid",
-    amount: 3400,
-    bookingDate: "2024-01-13",
-  },
-  {
-    id: 4,
-    customerName: "วรัญญู มณีนิล",
-    trip: "ทริปชุมชนเกาะยอ",
-    people: 3,
-    paymentStatus: "Paid",
-    amount: 10200,
-    bookingDate: "2024-01-12",
-  },
-];
-
-const chatbotInsights = {
-  totalConversations: 1247,
-  commonQuestions: [
-    { question: "แพ็กเกจทริปมีอะไรบ้าง?", count: 156 },
-    { question: "ระดับความยากเป็นอย่างไร?", count: 134 },
-    { question: "ควรเตรียมอะไรไปบ้าง?", count: 98 },
-    { question: "นโยบายยกเลิกเป็นอย่างไร?", count: 87 },
-    { question: "มีอุปกรณ์ให้ยืมหรือไม่?", count: 76 },
-  ],
-  satisfaction: 4.3,
 };
 
 const PAYMENT_STATUS_LABEL: Record<RecentBooking["paymentStatus"], string> = {
@@ -265,18 +127,34 @@ const formatDate = (iso: string) =>
   });
 
 export default function EmployeeDashboard() {
-  const [revenueRange, setRevenueRange] = useState<RangeKey>("weekly");
-  const [guestRange, setGuestRange] = useState<RangeKey>("weekly");
-  const [roomRange, setRoomRange] = useState<RangeKey>("weekly");
-  const [bookings, setBookings] = useState<RecentBooking[]>(INITIAL_RECENT_BOOKINGS);
-  const previousBookingsRef = useRef<RecentBooking[]>(INITIAL_RECENT_BOOKINGS);
+  const [revenueRange, setRevenueRange] = useState<RangeKey>("monthly");
+  const [guestRange, setGuestRange] = useState<RangeKey>("monthly");
+  const [roomRange, setRoomRange] = useState<RangeKey>("monthly");
+  const [topTripsSort, setTopTripsSort] = useState<"bookings" | "revenue">("revenue");
+  const [bookings, setBookings] = useState<RecentBooking[]>([]);
+  const [dashboardData, setDashboardData] = useState<DashboardData | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const previousBookingsRef = useRef<RecentBooking[]>([]);
   const suppressNotificationRef = useRef(false);
 
-  const revenueData = REVENUE_SERIES[revenueRange];
-  const guestsData = GUEST_SERIES[guestRange];
-  const roomsData = ROOM_SERIES[roomRange];
-  const openTripRatio = 83;
-  const totalTripsCount = 6;
+  useEffect(() => {
+    async function loadData() {
+      try {
+        const res = await apiFetch("/dashboard/");
+        if (res.ok) {
+          const data = (await res.json()) as DashboardData;
+          setDashboardData(data);
+          setBookings(data.recentBookings);
+          previousBookingsRef.current = data.recentBookings;
+        }
+      } catch (err) {
+        console.error("Failed to load dashboard data:", err);
+      } finally {
+        setIsLoading(false);
+      }
+    }
+    loadData();
+  }, []);
 
   useEffect(() => {
     const handleBookingCreated = (event: Event) => {
@@ -308,7 +186,7 @@ export default function EmployeeDashboard() {
           bookingDate: detail.bookingDate,
         };
 
-        const maxItems = Math.max(prev.length, INITIAL_RECENT_BOOKINGS.length);
+        const maxItems = Math.max(prev.length, 10);
         return [nextBooking, ...prev].slice(0, maxItems);
       });
     };
@@ -341,6 +219,24 @@ export default function EmployeeDashboard() {
     previousBookingsRef.current = bookings;
   }, [bookings]);
 
+  if (isLoading || !dashboardData) {
+    return (
+      <div className="flex min-h-[400px] w-full flex-col items-center justify-center gap-4">
+        <Loader2 className="h-10 w-10 animate-spin text-indigo-500" />
+        <div className="text-lg font-medium text-slate-500 animate-pulse">กำลังโหลดข้อมูลแดชบอร์ด...</div>
+      </div>
+    );
+  }
+
+  const revenueData = dashboardData.revenueSeries[revenueRange];
+  const guestsData = dashboardData.guestSeries[guestRange];
+  const roomsData = dashboardData.roomSeries[roomRange];
+  const activeTripsCount = dashboardData.activeTripsCount;
+  const totalBookingsCount = dashboardData.totalBookingsCount;
+  const totalRevenue = dashboardData.totalRevenue;
+  const topTrips = dashboardData.topTrips;
+  const chatbotInsights = dashboardData.chatbotInsights;
+
   return (
     <div className="space-y-6">
       <header className="space-y-1">
@@ -355,14 +251,10 @@ export default function EmployeeDashboard() {
             <div>
               <p className="text-sm text-gray-500">ทริปที่เปิดให้จอง</p>
               <div className="flex items-center">
-                <h3 className="mr-2 text-2xl font-bold">24</h3>
+                <h3 className="mr-2 text-2xl font-bold">{activeTripsCount}</h3>
               </div>
 
-              <div className="mt-1 flex items-center text-xs">
-                <TrendingUp className="mr-1 h-3 w-3 text-green-600" />
-                <span className="font-semibold text-green-600">8%</span>
-                <span className="ml-1 text-gray-500">เดือนนี้</span>
-              </div>
+
             </div>
           </CardContent>
         </Card>
@@ -375,13 +267,9 @@ export default function EmployeeDashboard() {
             <div>
               <p className="text-sm text-gray-500">ยอดการจองรวม</p>
               <div className="flex items-center">
-                <h3 className="mr-2 text-2xl font-bold">342</h3>
+                <h3 className="mr-2 text-2xl font-bold">{totalBookingsCount}</h3>
               </div>
-              <div className="mt-1 flex items-center text-xs">
-                <TrendingUp className="mr-1 h-3 w-3 text-green-600" />
-                <span className="font-semibold text-green-600">15%</span>
-                <span className="ml-1 text-gray-500">เดือนนี้</span>
-              </div>
+
             </div>
           </CardContent>
         </Card>
@@ -394,13 +282,9 @@ export default function EmployeeDashboard() {
             <div>
               <p className="text-sm text-gray-500">รายได้รวม</p>
               <div className="flex items-center">
-                <h3 className="mr-2 text-2xl font-bold">฿185,000</h3>
+                <h3 className="mr-2 text-2xl font-bold">฿{totalRevenue.toLocaleString("th-TH")}</h3>
               </div>
-              <div className="mt-1 flex items-center text-xs">
-                <TrendingUp className="mr-1 h-3 w-3 text-green-600" />
-                <span className="font-semibold text-green-600">22%</span>
-                <span className="ml-1 text-gray-500">เดือนนี้</span>
-              </div>
+
             </div>
           </CardContent>
         </Card>
@@ -411,8 +295,8 @@ export default function EmployeeDashboard() {
               <Star className="h-5 w-5 text-yellow-500" fill="currentColor" strokeWidth={0} />
               <span>ทริปยอดจองสูงสุด</span>
             </div>
-            <h4 className="mb-1 text-sm font-semibold">ทริปเดินป่าระยะไกลคลองยัน</h4>
-            <p className="text-xs text-gray-500">45 การจองในเดือนนี้</p>
+            <h4 className="mb-1 text-sm font-semibold truncate overflow-hidden whitespace-nowrap">{topTrips.length > 0 ? topTrips[0].name : "ไม่มีข้อมูล"}</h4>
+            <p className="text-xs text-gray-500">{topTrips.length > 0 ? `${topTrips[0].bookings} การจอง` : "-"}</p>
           </CardContent>
         </Card>
       </section>
@@ -433,7 +317,7 @@ export default function EmployeeDashboard() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onSelect={() => setRevenueRange("weekly")}>รายสัปดาห์</DropdownMenuItem>
+
                 <DropdownMenuItem onSelect={() => setRevenueRange("monthly")}>รายเดือน</DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => setRevenueRange("yearly")}>รายปี</DropdownMenuItem>
               </DropdownMenuContent>
@@ -460,8 +344,7 @@ export default function EmployeeDashboard() {
                     content={({ active, payload }) => {
                       if (active && payload && payload.length) {
                         const entry = payload[0];
-                        const amount = Number(entry?.value ?? 0) * 1000;
-                        const value = amount.toLocaleString("th-TH");
+                        const value = Number(entry?.value ?? 0).toLocaleString("th-TH");
                         const label = String(entry?.payload?.name ?? "");
                         return (
                           <div className="rounded border bg-white p-2 text-xs shadow-sm">
@@ -495,7 +378,7 @@ export default function EmployeeDashboard() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onSelect={() => setGuestRange("weekly")}>รายสัปดาห์</DropdownMenuItem>
+
                 <DropdownMenuItem onSelect={() => setGuestRange("monthly")}>รายเดือน</DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => setGuestRange("yearly")}>รายปี</DropdownMenuItem>
               </DropdownMenuContent>
@@ -553,7 +436,7 @@ export default function EmployeeDashboard() {
             <div>
               <CardTitle className="text-base font-semibold">สถานะการจองทริป</CardTitle>
               <div className="mt-1 text-xs text-gray-500">
- 
+
                 <div className="mt-1 flex items-center gap-3">
                   <span className="inline-flex items-center gap-1">
                     <span className="h-2 w-2 rounded-full bg-blue-500" />
@@ -582,7 +465,7 @@ export default function EmployeeDashboard() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onSelect={() => setRoomRange("weekly")}>รายสัปดาห์</DropdownMenuItem>
+
                 <DropdownMenuItem onSelect={() => setRoomRange("monthly")}>รายเดือน</DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => setRoomRange("yearly")}>รายปี</DropdownMenuItem>
               </DropdownMenuContent>
@@ -675,11 +558,10 @@ export default function EmployeeDashboard() {
                     <TableCell className="text-sm">{formatDate(booking.bookingDate)}</TableCell>
                     <TableCell>
                       <Badge
-                        className={`px-2.5 py-0.5 text-xs font-medium ${
-                          booking.paymentStatus === "Paid"
+                        className={`px-2.5 py-0.5 text-xs font-medium ${booking.paymentStatus === "Paid"
                             ? "bg-emerald-100 text-emerald-700"
                             : "bg-rose-100 text-rose-700"
-                        }`}
+                          }`}
                       >
                         {PAYMENT_STATUS_LABEL[booking.paymentStatus]}
                       </Badge>
@@ -707,35 +589,62 @@ export default function EmployeeDashboard() {
 
       <section className="grid grid-cols-1 gap-6 md:grid-cols-2">
         <Card>
-          <CardHeader className="p-4 pb-0">
-            <CardTitle className="text-base font-medium">5 ทริปยอดนิยม</CardTitle>
+          <CardHeader className="flex flex-row items-center justify-between p-4 pb-2">
+            <CardTitle className="text-base font-semibold">ทริปยอดนิยม</CardTitle>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="sm" className="h-8 gap-1 text-xs">
+                  <span>เรียงตาม{topTripsSort === "revenue" ? "รายได้" : "การจอง"}</span>
+                  <ChevronDown className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onSelect={() => setTopTripsSort("revenue")}>รายได้</DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => setTopTripsSort("bookings")}>จำนวนยอดจอง</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </CardHeader>
           <CardContent className="space-y-4 p-4">
-            {topTrips.map((trip, index) => (
-              <div
-                key={trip.id}
-                className="flex items-center justify-between rounded-lg bg-gray-50 p-3"
-              >
-                <div className="flex items-center">
-                  <div className="mr-3 flex h-8 w-8 items-center justify-center rounded-full bg-blue-500 text-sm font-bold text-white">
-                    {index + 1}
-                  </div>
-                  <div>
-                    <h4 className="text-sm font-medium">{trip.name}</h4>
-                    <div className="flex items-center text-xs text-gray-500">
-                      <Users className="mr-1 h-3 w-3" />
-                      {trip.bookings} การจอง
+            {[...topTrips]
+              .sort((a, b) => (topTripsSort === "revenue" ? b.revenue - a.revenue : b.bookings - a.bookings))
+              .slice(0, 5)
+              .map((trip, index) => (
+                <div
+                  key={trip.id}
+                  className="group flex items-center justify-between rounded-xl border border-transparent p-2 transition-all hover:bg-slate-50 hover:border-slate-100"
+                >
+                  <div className="flex items-center gap-3 overflow-hidden">
+                    <div className="relative h-12 w-12 shrink-0 overflow-hidden rounded-lg bg-slate-100 border border-slate-200">
+                      {trip.image ? (
+                        <img src={trip.image} alt={trip.name} className="h-full w-full object-cover transition-transform group-hover:scale-110" />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center text-slate-300">
+                          <MapPin className="h-5 w-5" />
+                        </div>
+                      )}
+                      <div className="absolute left-0 top-0 flex h-4 w-4 items-center justify-center rounded-br-lg bg-blue-600 text-[10px] font-bold text-white shadow-sm">
+                        {index + 1}
+                      </div>
+                    </div>
+                    <div className="min-w-0">
+                      <h4 className="truncate text-sm font-semibold text-slate-800" title={trip.name}>{trip.name}</h4>
+                      <div className="flex items-center gap-2 text-xs text-slate-500">
+                        <Users className="h-3 w-3" />
+                        <span>{trip.bookings} การจอง</span>
+                      </div>
                     </div>
                   </div>
+                  <div className="text-right">
+                    <p className="text-sm font-bold text-slate-900">
+                      ฿{trip.revenue.toLocaleString("th-TH")}
+                    </p>
+                    <p className="text-[10px] font-medium text-slate-500">
+                      {trip.travelers.toLocaleString("th-TH")} คน
+                    </p>
+                    <p className="text-[10px] font-medium text-slate-400 uppercase tracking-wider">รายได้</p>
+                  </div>
                 </div>
-                <div className="text-right">
-                  <p className="text-sm font-semibold">
-                    ฿{trip.revenue.toLocaleString("th-TH")}
-                  </p>
-                  <p className="text-xs text-gray-500">รายได้</p>
-                </div>
-              </div>
-            ))}
+              ))}
           </CardContent>
         </Card>
 

@@ -38,7 +38,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { GetTripsList } from "@/api/trip";
+import { GetTripsList, UpdateTrip } from "@/api/trip";
 
 export type TripStatus = "published" | "draft" | "full" | "maintenance";
 
@@ -62,6 +62,8 @@ export type TripRecord = {
   lastUpdated: string;
   tags: string[];
   imageUrl: string;
+  /** แสดงบนหน้าลูกค้า (สอดคล้องกับ is_active บน API) */
+  isActive: boolean;
 };
 
 // Keeping for reference/fallback
@@ -196,6 +198,7 @@ const Trips = () => {
             lastUpdated: t.created_at ? new Date(t.created_at).toLocaleDateString('th-TH') : "-",
             tags: [],
             imageUrl: t.thumbnail_image || "",
+            isActive: t.is_active !== false,
           };
         });
         setTrips(mappedTrips);
@@ -287,26 +290,28 @@ const Trips = () => {
     });
   }, [searchTerm, statusFilter, categoryFilter, trips]);
 
-  const [visibilityMap, setVisibilityMap] = useState<Record<string, boolean>>({});
-
-  // Initialize visibility map when trips change
-  useEffect(() => {
-    if (trips.length > 0) {
-      setVisibilityMap((prev) => {
-        const newMap = { ...prev };
-        trips.forEach((t) => {
-          if (newMap[t.id] === undefined) newMap[t.id] = true;
-        });
-        return newMap;
-      });
+  const onToggleVisible = async (tripId: string) => {
+    const trip = trips.find((t) => t.id === tripId);
+    if (!trip) return;
+    const next = !trip.isActive;
+    setTrips((prev) =>
+      prev.map((t) => (t.id === tripId ? { ...t, isActive: next } : t)),
+    );
+    const updated = await UpdateTrip(tripId, { is_active: next });
+    if (!updated) {
+      setTrips((prev) =>
+        prev.map((t) => (t.id === tripId ? { ...t, isActive: !next } : t)),
+      );
+      window.alert("ไม่สามารถอัปเดตการมองเห็นทริปได้ กรุณาลองใหม่หรือตรวจสอบการล็อกอิน");
+      return;
     }
-  }, [trips]);
-
-  const onToggleVisible = (tripId: string) => {
-    setVisibilityMap((previous) => ({
-      ...previous,
-      [tripId]: !previous[tripId],
-    }));
+    if (updated.is_active !== undefined && updated.is_active !== next) {
+      setTrips((prev) =>
+        prev.map((t) =>
+          t.id === tripId ? { ...t, isActive: !!updated.is_active } : t,
+        ),
+      );
+    }
   };
 
   return (
@@ -567,21 +572,21 @@ const Trips = () => {
                                       easing: "ease-out",
                                     },
                                   );
-                                  onToggleVisible(trip.id);
+                                  void onToggleVisible(trip.id);
                                 }}
                                 aria-label={
-                                  (visibilityMap[trip.id] ?? true)
+                                  trip.isActive
                                     ? `ซ่อนทริป ${trip.name}`
                                     : `แสดงทริป ${trip.name}`
                                 }
                                 title={
-                                  (visibilityMap[trip.id] ?? true)
-                                    ? "ซ่อนทริปนี้"
-                                    : "แสดงทริปนี้"
+                                  trip.isActive
+                                    ? "ซ่อนทริปนี้จากหน้าลูกค้า"
+                                    : "แสดงทริปนี้บนหน้าลูกค้า"
                                 }
                                 className="flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:shadow-sm"
                               >
-                                {visibilityMap[trip.id] ?? true ? (
+                                {trip.isActive ? (
                                   <Eye className="h-4 w-4" />
                                 ) : (
                                   <EyeOff className="h-4 w-4 text-slate-400" />
@@ -616,7 +621,7 @@ const Trips = () => {
           {nextDeparture ? (
             <Card>
               <CardHeader className="gap-1.5">
-                <CardTitle className="text-base pt-5">กำหนดการเดินทางถัดไป</CardTitle>
+                {/* <CardTitle className="text-base pt-5">กำหนดการเดินทางถัดไป</CardTitle> */}
               </CardHeader>
               <CardContent className="space-y-4 pb-6">
                 <div className="flex flex-col gap-2 rounded-lg border border-slate-200 bg-slate-50 p-4">
