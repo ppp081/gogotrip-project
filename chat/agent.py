@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import httpx
 import json
 import logging
@@ -27,6 +28,7 @@ from .prompts import (
     build_trip_system_prompt,
     build_friendly_system_prompt,
     PAYMENT_VERIFY_SYSTEMPROMPT,
+    REVIEW_SUMMARY_SYSTEMPROMPT,
 )
 
 from .tools import get_trips, get_date, get_equipments, get_my_trips
@@ -528,7 +530,7 @@ def analyze_reviews():
     ratings = list(Rating.objects.all())
     total = len(ratings)
     if total == 0:
-        return Summary.objects.create()
+        return Summary.objects.create(highlights=[], suggestion_bullets=[])
 
     avg = sum(r.service_rating for r in ratings) / total
     
@@ -551,18 +553,79 @@ def analyze_reviews():
     neg = sum(1 for r in ratings if r.service_rating <= 2)
     
     comments = [r.comment for r in ratings if r.comment and r.comment.strip()][:50]
-    data = {"issues": [], "suggestion": "พยายามรักษามาตรฐานบริการอย่างต่อเนื่อง", "faqs": []}
-    
+    default_bullets = [
+        "รักษามาตรฐานการสื่อสารก่อน-ระหว่าง-หลังทริปให้สม่ำเสมอ",
+        "ตรวจสอบความพร้อมของยานพาหนะและไทม์ไลน์กับไกด์ก่อนออกเดินทางทุกครั้ง",
+        "ชี้แจงรายการที่รวม/ไม่รวมในทริปให้ชัดเจนในช่องทางลูกค้าทุกคน",
+        "เก็บฟีดแบ็กเชิงลบอย่างรวดเร็วและมีขั้นตอนแก้ไขที่ลูกค้าเข้าใจ",
+        "พัฒนาคลังคำตอบสำหรับคำถามที่พบบ่อยเรื่องการจ่ายเงินและการยกเลิก",
+        "ทบทวนความเหมาะสมของอุปกรณ์เสริมตามประเภททริปและกลุ่มลูกค้า",
+        "ส่งเสริมการฝึกอบรมไกด์เรื่องความปลอดภัยและการดูแลผู้สูงอายุ/ครอบครัว",
+    ]
+    default_suggestion = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(default_bullets))
+    data = {
+        "highlights": [],
+        "issues": [],
+        "suggestion": default_suggestion,
+        "suggestion_bullets": list(default_bullets),
+        "faqs": [],
+    }
+
     if comments:
         text_feed = "\n".join(f"- {c}" for c in comments)
         try:
             resp = llm_fast.invoke([
-                {"role": "system", "content": "You are a customer feedback analyzer. Analyze the given comments in Thai. Output exactly valid JSON with keys: 'issues'[array of {title, description, severity(critical/warning), mentions(int)}], 'suggestion'(str), and 'faqs'[array of {question, answer}]."},
-                {"role": "user", "content": f"Comments:\n{text_feed}"}
+                {"role": "system", "content": REVIEW_SUMMARY_SYSTEMPROMPT},
+                {"role": "user", "content": f"Comments:\n{text_feed}"},
             ])
             extracted = json.loads(_strip_json_code_fence(resp.content))
+
+            raw_highlights = extracted.get("highlights") or []
+            highlights: list = []
+            if isinstance(raw_highlights, list):
+                for h in raw_highlights[:8]:
+                    if not isinstance(h, dict):
+                        continue
+                    title = str(h.get("title") or "").strip()
+                    desc = str(h.get("description") or "").strip()
+                    try:
+                        m = int(h.get("mentions") or 0)
+                    except (TypeError, ValueError):
+                        m = 1
+                    if title and desc and m >= 1:
+                        highlights.append(
+                            {"title": title, "description": desc, "mentions": m}
+                        )
+            data["highlights"] = highlights
+
             data["issues"] = extracted.get("issues", [])
-            data["suggestion"] = extracted.get("suggestion", "")
+            sugs = extracted.get("suggestions")
+            if isinstance(sugs, list) and sugs:
+                lines = []
+                for s in sugs:
+                    raw = str(s).strip()
+                    if not raw:
+                        continue
+                    raw = re.sub(r"^[\-\u2022\u2013\u2014]\s*", "", raw)
+                    raw = re.sub(r"^\d+\.\s*", "", raw).strip()
+                    if raw:
+                        lines.append(raw)
+                lines = [ln for ln in lines if ln]
+                if lines:
+                    data["suggestion_bullets"] = lines
+                    data["suggestion"] = "\n".join(
+                        f"{i + 1}. {t}" for i, t in enumerate(lines)
+                    )
+                else:
+                    data["suggestion"] = default_suggestion
+                    data["suggestion_bullets"] = list(default_bullets)
+            else:
+                legacy = (extracted.get("suggestion") or "").strip()
+                data["suggestion"] = legacy or default_suggestion
+                if legacy:
+                    data["suggestion_bullets"] = []
+                else:
+                    data["suggestion_bullets"] = list(default_bullets)
             data["faqs"] = extracted.get("faqs", [])
         except Exception as e:
             logger.error(f"LLM parse error: {e}")
@@ -577,7 +640,9 @@ def analyze_reviews():
         neutral_percentage=round(neu / total * 100),
         negative_count=neg,
         negative_percentage=round(neg / total * 100),
+        highlights=data.get("highlights", []),
         issues=data.get("issues", []),
         suggestion=data.get("suggestion", ""),
-        faqs=data.get("faqs", [])
+        suggestion_bullets=data.get("suggestion_bullets", []),
+        faqs=data.get("faqs", []),
     )

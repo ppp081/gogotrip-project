@@ -38,6 +38,27 @@ from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 logger = logging.getLogger(__name__)
 
 
+def _decimal_from_price(value, *, default: Decimal) -> Decimal:
+    """Parse ราคาจาก meta (เช่น '3,000' / '1,250.50') — Decimal() รับค่าที่มี comma ไม่ได้."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return Decimal(str(value))
+    s = str(value).strip()
+    if not s:
+        return default
+    for ch in (",", " ", "฿", "\u0e3f", "\xa0"):
+        s = s.replace(ch, "")
+    if not s:
+        return default
+    try:
+        return Decimal(s)
+    except (decimal.InvalidOperation, ValueError, ArithmeticError):
+        return default
+
+
 def _format_line_outgoing_for_debug(messages) -> str:
     """Human-readable debug dump for outbound LINE messages (Thai prints as Thai, not \\uXXXX)."""
     if not messages:
@@ -712,7 +733,7 @@ def handle_postback(event):
             f"💰 ราคาเพียง {trip_price_per_person} บาท/คน เท่านั้น!\n\n"
             "🌈 ทางเรามีอุปกรณ์เสริมให้เลือก หากอยากเพิ่มความสนุกระหว่างทริป\n"
             "▪️ ถุงนอน — 600 บาท\n"
-            "▪️ เต็นท์ 2 คน — 1,500 \n"
+            "▪️ เต็นท์ — 1,500 \n"
             "▪️ ร่มกันแดด — 250\n\n"
         
             "📩 แจ้งจำนวนผู้เดินทางได้เลยครับ\n"
@@ -1832,8 +1853,11 @@ def create_booking_and_payment(
         line_user.save(update_fields=["user"])
         logger.info(f"👤 Created new user for LINE user {line_user.display_name} ({line_user.line_user_id})")
 
-    # ราคาทริปหลัก
-    base_price = Decimal(meta.get("trip_price_per_person") or trip.price_per_person)
+    # ราคาทริปหลัก (meta มักเป็นรูปแบบแสดงผล เช่น "3,000" มี comma)
+    base_price = _decimal_from_price(
+        meta.get("trip_price_per_person"),
+        default=Decimal(str(trip.price_per_person)),
+    )
     person_count = int(meta.get("booking_person_count", 1))
     trip_total_price = base_price * person_count
 

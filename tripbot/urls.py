@@ -15,12 +15,19 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
+from django.http import HttpResponse
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 from chat.line_webhook import line_webhook
 
+
+def _root_ok(_request):
+    return HttpResponse("ok", content_type="text/plain")
+
+
 urlpatterns = [
+    path("", _root_ok, name="root"),
     path('admin/', admin.site.urls),
     path('webhook/line/', line_webhook, name='line_webhook'),
     path('api/', include('chat.urls')),

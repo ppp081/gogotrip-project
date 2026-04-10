@@ -214,7 +214,17 @@ class Summary(models.Model):
     negative_percentage = models.FloatField(default=0)
 
     issues = models.JSONField(default=list, blank=True)
+    highlights = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="จุดเด่นเชิงบวกจากรีวิว (title/description/mentions) สำหรับแดชบอร์ด",
+    )
     suggestion = models.TextField(blank=True)
+    suggestion_bullets = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="รายการคำแนะนำแบบ structured (สตริงต่อข้อ) แยกจาก suggestion เดิม",
+    )
     faqs = models.JSONField(default=list, blank=True)
     ratings_stats = models.JSONField(default=list, blank=True)
 

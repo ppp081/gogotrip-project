@@ -11,8 +11,10 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 import os
+
 load_dotenv()
 
 # Frontend Setting
@@ -55,13 +57,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_API_URL = os.getenv("OPENROUTER_API_URL", "https://openrouter.ai/api/v1")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DEBUG', 'False') == 'True'
+DEBUG = os.environ.get("DEBUG", "False") == "True"
+
+if not SECRET_KEY and not DEBUG:
+    raise ImproperlyConfigured(
+        "ตั้งค่า DJANGO_SECRET_KEY ใน Cloud Run → Variables (หรือ Secret Manager)"
+    )
+if not SECRET_KEY and DEBUG:
+    SECRET_KEY = "django-insecure-dev-only-local"
 
 #ALLOWED_HOSTS = [
 #    "localhost",
@@ -152,20 +161,38 @@ ADMIN_WS_TOKEN = (os.getenv('ADMIN_WS_TOKEN') or '').strip()
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+_db_host = (os.environ.get("DB_HOST") or "").strip()
+# Supabase Postgres ทางอินเทอร์เน็ต — ใช้ SSL เสมอเมื่อมี HOST
+_db_options = {"sslmode": "require"} if _db_host else {}
+
 DATABASES = {
     "default": {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.environ.get('DB_NAME'),
-        'USER': os.environ.get('DB_USER'),
-        'PASSWORD': os.environ.get('DB_PASSWORD'),
-        'HOST': os.environ.get('DB_HOST'),
-        'PORT': os.environ.get('DB_PORT'),
-    },
-    
-    "OPTIONS": {
-            "sslmode": "require",
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("DB_NAME"),
+        "USER": os.environ.get("DB_USER"),
+        "PASSWORD": os.environ.get("DB_PASSWORD"),
+        "HOST": os.environ.get("DB_HOST"),
+        "PORT": os.environ.get("DB_PORT") or "5432",
+        "OPTIONS": _db_options,
     },
 }
+
+# Supabase pooler (PgBouncer transaction mode, พอร์ต 6543): ปิด server-side cursors — กัน OperationalError / 500 บน Cloud Run
+_db_port = (os.environ.get("DB_PORT") or "").strip()
+if "pooler.supabase.com" in _db_host or _db_port == "6543":
+    DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
+
+# Cloud Run + Postgres ภายนอก: ไม่เก็บ connection ค้าง (ลด stale / pooler เต็ม)
+if not DEBUG:
+    DATABASES["default"]["CONN_MAX_AGE"] = 0
+
+# Docker build: Dockerfile ตั้ง DJANGO_BUILD_PHASE=1 → not _is_image_build เป็น False → เงื่อนไขด้านล่างเป็น False ทั้งก้อน (ไม่ raise) แม้ไม่มี DB_*
+_is_image_build = os.environ.get("DJANGO_BUILD_PHASE") == "1"
+if not DEBUG and not _is_image_build and not (_db_host and os.environ.get("DB_NAME")):
+    raise ImproperlyConfigured(
+        "Production ใช้ Supabase Postgres เสมอ — ตั้งค่า DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT "
+        "ใน Cloud Run ให้ตรง Supabase Dashboard → Database"
+    )
 
 # Password validation
 # https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
@@ -213,16 +240,17 @@ MEDIA_ROOT = BASE_DIR / 'media'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Django REST Framework — session cookie สำหรับแดชบอร์ด admin
+# ใช้ SessionAuthenticationWithoutCSRF เพื่อไม่ให้ POST จาก SPA ข้ามโดเมนโดน 403 CSRF
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.SessionAuthentication",
+        "chat.authentication.SessionAuthenticationWithoutCSRF",
     ],
 }
 
 # CORS — ต้องระบุ origin แบบชัดเจนเมื่อใช้ credentials (cookie session)
 _cors_origins = os.getenv(
     "CORS_ALLOWED_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173",
+    "http://localhost:5173,http://127.0.0.1:5173,https://tripbot-frontend-294086862024.asia-southeast1.run.app",
 )
 CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins.split(",") if o.strip()]
 CORS_ALLOW_CREDENTIALS = True
@@ -231,5 +259,41 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_ALL_ORIGINS = False
 
 CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS.copy()
+
+# Local: Lax + ไม่บังคับ Secure (http://)
 SESSION_COOKIE_SAMESITE = "Lax"
 SESSION_COOKIE_HTTPONLY = True
+
+# Production (frontend คนละโดเมนกับ API เช่น Cloud Run): ต้อง SameSite=None + Secure
+# ไม่งั้น fetch(..., credentials: "include") จาก https://tripbot-frontend-....run.app จะไม่ยอมแนบ session cookie
+if not DEBUG:
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_SAMESITE = "None"
+    CSRF_COOKIE_SECURE = True
+    CSRF_COOKIE_SAMESITE = "None"
+
+# Cloud Logging / Daphne — ส่ง traceback ไป stdout
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "simple": {
+            "format": "{levelname} {asctime} {name} {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+        },
+    },
+    "root": {"handlers": ["console"], "level": "INFO"},
+    "loggers": {
+        "django.request": {
+            "handlers": ["console"],
+            "level": "ERROR",
+            "propagate": False,
+        },
+    },
+}

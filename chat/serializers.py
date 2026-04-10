@@ -226,7 +226,8 @@ class SummarySerializer(serializers.ModelSerializer):
         model = Summary
         fields = [
             'id', 'total_reviews', 'average_rating',
-            'sentiment', 'issues', 'suggestion', 'faqs', 'ratings_stats', 'created_at',
+            'sentiment', 'highlights', 'issues', 'suggestion', 'suggestion_bullets',
+            'faqs', 'ratings_stats', 'created_at',
         ]
         read_only_fields = fields
 

@@ -1,0 +1,16 @@
+# Build context (local docker / Cloud Build): ไม่ใส่ secrets ลง image
+.env
+.env.*
+!.env.example
+venv
+.venv
+__pycache__
+*.pyc
+.git
+.idea
+.vscode
+staticfiles
+media
+*.md
+htmlcov
+.pytest_cache

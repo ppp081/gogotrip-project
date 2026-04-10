@@ -310,6 +310,49 @@ class TripViewSet(viewsets.ModelViewSet):
                     
         return Response({"status": "ok", "trip_id": str(trip.id), "sent_count": count_sent})
 
+    @action(detail=True, methods=['post'], url_path='feedback-to-line-user')
+    def feedback_to_line_user(self, request, pk=None):
+        """
+        ส่งข้อความขอ feedback (Quick Reply) ไปที่ LINE user ID ที่ระบุ — ใช้ทดสอบ / ส่งให้คนเดียว
+        Body: { "line_user_id": "U...", "booking_id": "<optional uuid>" }
+        """
+        from .line_webhook import send_post_trip_feedback
+
+        line_user_id = (request.data.get("line_user_id") or "").strip()
+        if not line_user_id:
+            return Response(
+                {"detail": "กรุณาระบุ line_user_id"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            trip = self.get_object()
+        except Trip.DoesNotExist:
+            return Response({"error": "Trip not found"}, status=404)
+
+        booking_id = request.data.get("booking_id")
+        booking_id = str(booking_id).strip() if booking_id else None
+
+        ok = send_post_trip_feedback(
+            line_user_id,
+            str(trip.id),
+            trip.name,
+            booking_id,
+        )
+        if not ok:
+            return Response(
+                {"status": "error", "detail": "ส่งข้อความ LINE ไม่สำเร็จ (ดู server log)"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(
+            {
+                "status": "ok",
+                "trip_id": str(trip.id),
+                "line_user_id": line_user_id,
+                "booking_id": booking_id,
+            }
+        )
+
 
 class BookingViewSet(viewsets.ModelViewSet):
     """CRUD operations for bookings"""
