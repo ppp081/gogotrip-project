@@ -156,9 +156,16 @@ export interface SummaryIssue {
   mentions: number
 }
 
+export interface SummaryHighlight {
+  title: string
+  description: string
+  mentions: number
+}
+
 export interface SummaryFaq {
   question: string
-  responses: number
+  answer?: string
+  responses?: number
 }
 
 export interface AISummary {
@@ -170,9 +177,12 @@ export interface AISummary {
     neutral: { count: number; percentage: number }
     negative: { count: number; percentage: number }
   }
+  highlights?: SummaryHighlight[]
   issues: SummaryIssue[]
   suggestion: string
+  suggestion_bullets?: string[]
   faqs: SummaryFaq[]
+  ratings_stats: { stars: number; count: number; percentage: number }[]
   created_at: string
 }
 

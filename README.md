@@ -1,4 +1,22 @@
-# React + TypeScript + Vite
+# Trip frontend (React + TypeScript + Vite)
+
+## Environment variables
+
+1. Copy the example file and edit locally (never commit real `.env` secrets):
+
+   ```sh
+   cp .env.example .env
+   ```
+
+2. Set **`VITE_BACKEND_API`** in `.env` to the base URL of your backend API **including the `/api` segment** (same value the app uses in `src/api/client.ts`).
+
+   | Example value | When to use |
+   |---------------|-------------|
+   | `http://127.0.0.1:8000/api` | Local Django (or other backend) on your machine |
+   | `https://your-ngrok-host.example/api` | Temporary tunnel (use your own host, not a shared secret) |
+   | `/api` | Browser calls same-origin `/api/...` (e.g. Vite dev proxy per `.env.development`, or production nginx) |
+
+   `.env.example` sets `VITE_BACKEND_API` to a **non-URL placeholder** (`your-backend-base-url-including-/api`); replace it with a real URL or path for your setup.
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
@@ -69,10 +87,11 @@ export default tseslint.config([
 ```
 
 
+## Deploy to Cloud Run
 
+```sh
 gcloud builds submit \
   --tag gcr.io/gogotrip-senior-project/tripbot-frontend
-
 
 gcloud run deploy tripbot-frontend \
   --image gcr.io/gogotrip-senior-project/tripbot-frontend \
@@ -80,3 +99,8 @@ gcloud run deploy tripbot-frontend \
   --region asia-southeast1 \
   --allow-unauthenticated \
   --port 80
+```
+
+After deploy, open the **Service URL** that `gcloud` prints (example: `https://tripbot-frontend-294086862024.asia-southeast1.run.app` in the browser). Do not run that URL as a shell command.
+
+The production image sets `VITE_BACKEND_API=/api` and **nginx** proxies `/api/` to `tripbot-backend` on Cloud Run. If your backend URL changes, update `proxy_pass` and `Host` in `nginx.conf` and rebuild.

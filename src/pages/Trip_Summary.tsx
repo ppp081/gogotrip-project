@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 import {
   AlertCircle,
   AlertTriangle,
-  Calendar,
+  Heart,
   MapPin,
   MessageSquare,
   RefreshCw,
@@ -42,15 +42,6 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -60,15 +51,13 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
 import "./summary-theme.css"
 
-type TripTab = "all" | "grouped"
-type TripSortOption = "latest-review" | "rating-desc" | "reviewers-desc"
+type TripSortOption =
+  | "latest-review"
+  | "rating-desc"
+  | "reviewers-desc"
+  | "travelers-desc"
 
 interface EnrichedTrip {
   id: string
@@ -76,7 +65,6 @@ interface EnrichedTrip {
   destination: string
   image: string
   tripDateLabel: string
-  rating: number
   serviceRating: number
   reviewsCount: number
   reviewersCount: number
@@ -90,10 +78,13 @@ interface EnrichedTrip {
 const DEFAULT_TRIP_IMAGE =
   "https://images.unsplash.com/photo-1499856871958-5b9627545d1a"
 
+const TRIP_LIST_PREVIEW_LIMIT = 8
+
 const TRIP_SORT_OPTIONS: { value: TripSortOption; label: string }[] = [
-  { value: "latest-review", label: "วันที่รีวิวล่าสุด" },
-  { value: "rating-desc", label: "คะแนนมากไปน้อย" },
-  { value: "reviewers-desc", label: "จำนวนคนรีวิวมากไปน้อย" },
+  { value: "reviewers-desc", label: "คนให้คะแนนมากสุดก่อน" },
+  { value: "travelers-desc", label: "ผู้เดินทางมากสุดก่อน" },
+  { value: "rating-desc", label: "คะแนนบริการมากไปน้อย" },
+  { value: "latest-review", label: "รีวิวล่าสุดก่อน" },
 ]
 
 function createInitialRatingsStats() {
@@ -122,6 +113,27 @@ function formatThaiDate(
   return date.toLocaleDateString("th-TH", options)
 }
 
+/** คำแนะนำเป็นสตริงแยกรายข้อ — ใช้ suggestion_bullets จาก API ถ้ามี ไม่เช่นนั้นแยกจาก suggestion เดิม */
+function suggestionItemsFromSummary(summary: AISummary): string[] {
+  const bullets = summary.suggestion_bullets?.map((s) => s.trim()).filter(Boolean)
+  if (bullets && bullets.length > 0) return bullets
+
+  const raw = (summary.suggestion || "").trim()
+  if (!raw) return []
+
+  const lines = raw.split(/\n+/).map((l) => l.trim()).filter(Boolean)
+  const out: string[] = []
+  for (const line of lines) {
+    const numbered = line.match(/^\d+\.\s*(.+)$/u)
+    if (numbered) {
+      out.push(numbered[1].replace(/^[-•–\u2022]\s*/, "").trim())
+      continue
+    }
+    out.push(line.replace(/^[-•–\u2022]\s*/, "").trim())
+  }
+  return out.filter(Boolean)
+}
+
 function formatThaiDateTime(value: string | null) {
   if (!value) return "-"
 
@@ -141,26 +153,11 @@ function getReviewAuthor(review: Rating) {
   return review.user_name || `User ${String(review.user).slice(0, 6)}`
 }
 
-function ReviewStars({
-  value,
-  iconClassName = "h-3.5 w-3.5",
-}: {
-  value: number
-  iconClassName?: string
-}) {
-  return (
-    <div className="flex items-center gap-1">
-      {Array.from({ length: 5 }).map((_, index) => (
-        <Star
-          key={index}
-          className={`${iconClassName} ${index < Math.round(value)
-            ? "fill-primary text-primary"
-            : "text-muted-foreground/40"
-            }`}
-        />
-      ))}
-    </div>
-  )
+/** Ratings from the API may be strings or missing; keep UI from showing NaN. */
+function formatReviewScore(value: unknown): string {
+  const n = typeof value === "number" ? value : Number(value)
+  if (!Number.isFinite(n)) return "—"
+  return n.toFixed(1)
 }
 
 function EmptyReviewsState({ message }: { message: string }) {
@@ -179,10 +176,10 @@ export default function AIInsightDashboard() {
   const [ratingsStats, setRatingsStats] = useState(createInitialRatingsStats)
   const [totalReviews, setTotalReviews] = useState(0)
   const [averageRating, setAverageRating] = useState(0)
-  const [activeTab, setActiveTab] = useState<TripTab>("all")
   const [searchTerm, setSearchTerm] = useState("")
   const [categoryFilter, setCategoryFilter] = useState("all")
-  const [sortBy, setSortBy] = useState<TripSortOption>("latest-review")
+  const [sortBy, setSortBy] = useState<TripSortOption>("reviewers-desc")
+  const [tripListExpanded, setTripListExpanded] = useState(false)
   const [ratingDeltaMonth, setRatingDeltaMonth] = useState(0)
   const [summary, setSummary] = useState<AISummary | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(true)
@@ -355,13 +352,8 @@ export default function AIInsightDashboard() {
               tripRatings.map((rating) => String(rating.user))
             ).size
 
-            const totalTripRating = tripRatings.reduce(
-              (acc, rating) => acc + (rating.trip_rating || 0),
-              0
-            )
-
             const totalServiceRating = tripRatings.reduce(
-              (acc, rating) => acc + (rating.service_rating || 0),
+              (acc, rating) => acc + (Number(rating.service_rating) || 0),
               0
             )
 
@@ -373,7 +365,6 @@ export default function AIInsightDashboard() {
                 trip.province || trip.location || trip.country || "Unknown",
               image: trip.thumbnail_image || DEFAULT_TRIP_IMAGE,
               tripDateLabel: formatThaiDate(trip.start_date),
-              rating: totalTripRating / tripRatings.length,
               serviceRating: totalServiceRating / tripRatings.length,
               reviewsCount: tripRatings.length,
               reviewersCount,
@@ -433,7 +424,7 @@ export default function AIInsightDashboard() {
 
     if (sortBy === "rating-desc") {
       return (
-        right.rating - left.rating ||
+        right.serviceRating - left.serviceRating ||
         right.reviewersCount - left.reviewersCount ||
         rightLastReview - leftLastReview
       )
@@ -443,17 +434,33 @@ export default function AIInsightDashboard() {
       return (
         right.reviewersCount - left.reviewersCount ||
         right.reviewsCount - left.reviewsCount ||
-        right.rating - left.rating ||
+        right.totalTripTravelers - left.totalTripTravelers ||
+        right.serviceRating - left.serviceRating ||
+        rightLastReview - leftLastReview
+      )
+    }
+
+    if (sortBy === "travelers-desc") {
+      return (
+        right.totalTripTravelers - left.totalTripTravelers ||
+        right.reviewersCount - left.reviewersCount ||
+        right.reviewsCount - left.reviewsCount ||
+        right.serviceRating - left.serviceRating ||
         rightLastReview - leftLastReview
       )
     }
 
     return (
       rightLastReview - leftLastReview ||
-      right.rating - left.rating ||
+      right.serviceRating - left.serviceRating ||
       right.reviewersCount - left.reviewersCount
     )
   })
+
+  const displayedTrips =
+    tripListExpanded || sortedTrips.length <= TRIP_LIST_PREVIEW_LIMIT
+      ? sortedTrips
+      : sortedTrips.slice(0, TRIP_LIST_PREVIEW_LIMIT)
 
   const visibleReviewsCount = sortedTrips.reduce(
     (acc, trip) => acc + trip.reviewsCount,
@@ -620,7 +627,7 @@ export default function AIInsightDashboard() {
           </Card>
         </div>
 
-        <Card className="mb-8 overflow-hidden">
+        <Card className="mb-8 overflow-hidden py-6">
           <CardHeader className="border-b bg-muted/30">
             <div className="flex items-center gap-2">
               <Sparkles className="h-5 w-5 text-primary" />
@@ -633,257 +640,338 @@ export default function AIInsightDashboard() {
                 ยังไม่มีข้อมูลการวิเคราะห์ กดปุ่ม "อัปเดตการวิเคราะห์" เพื่อเริ่ม
               </div>
             ) : (
-              <div className="space-y-6">
-                {summary.issues.length > 0 && (
+              (() => {
+                const suggestionItems = suggestionItemsFromSummary(summary)
+                return (
+              <div className="space-y-8">
+                {(summary.highlights?.length ?? 0) > 0 && (
                   <div className="space-y-3">
-                    {summary.issues.map((issue, idx) => (
-                      <Alert
-                        key={idx}
-                        className={`relative overflow-hidden ${issue.severity === "critical"
-                          ? "border-destructive/60 bg-destructive/10"
-                          : issue.severity === "warning"
-                            ? "border-amber-500/60 bg-amber-500/10"
-                            : "border-blue-500/60 bg-blue-500/10"
-                          }`}
-                      >
-                        <Badge
-                          variant={issue.severity === "critical" ? "destructive" : "outline"}
-                          className={`absolute right-3 top-3 ${issue.severity === "warning"
-                            ? "bg-amber-100 text-amber-700 hover:bg-amber-100 border-amber-200"
-                            : issue.severity === "critical"
-                              ? ""
-                              : "bg-blue-100 text-blue-700 hover:bg-blue-100 border-blue-200"
-                            }`}
+                    <div className="flex items-center gap-2 text-emerald-800">
+                      <Heart className="h-5 w-5 fill-emerald-500/25 text-emerald-600" />
+                      <h4 className="text-base font-semibold tracking-tight">
+                        จุดเด่นที่ลูกค้าชื่นชม
+                      </h4>
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-1 md:grid-cols-2">
+                      {(summary.highlights ?? []).map((h, idx) => (
+                        <div
+                          key={idx}
+                          className="relative rounded-xl border border-emerald-200/80 bg-gradient-to-br from-emerald-50/90 to-white px-4 py-4 shadow-sm"
                         >
-                          {issue.mentions} รีวิว
-                        </Badge>
-                        <AlertCircle
-                          className={`h-5 w-5 ${issue.severity === "critical"
-                            ? "text-destructive"
-                            : issue.severity === "warning"
-                              ? "text-amber-500"
-                              : "text-blue-500"
-                            }`}
-                        />
-                        <AlertDescription className="pt-1">
-                          <div className="pr-20">
-                            <h4 className="mb-1 font-semibold text-foreground">
-                              {issue.title}
-                            </h4>
-                            <p className="text-sm text-muted-foreground leading-relaxed">
-                              {issue.description}
-                            </p>
-                          </div>
-                        </AlertDescription>
-                      </Alert>
-                    ))}
+                          <Badge
+                            variant="outline"
+                            className="absolute right-3 top-3 border-emerald-200 bg-white/90 text-emerald-800 hover:bg-white"
+                          >
+                            {h.mentions} รีวิว
+                          </Badge>
+                          <h5 className="pr-20 text-sm font-semibold text-emerald-950 leading-snug">
+                            {h.title}
+                          </h5>
+                          <p className="mt-2 text-sm text-emerald-900/80 leading-relaxed">
+                            {h.description}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
-                {summary.suggestion && (
-                  <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-5">
-                    <div className="flex items-center gap-2 mb-3">
-                      <Sparkles className="h-5 w-5 text-emerald-600" />
-                      <h5 className="font-semibold text-emerald-900">คำแนะนำเพื่อการพัฒนา</h5>
+
+                {summary.issues.length > 0 && (
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-amber-900">
+                      <AlertTriangle className="h-5 w-5 text-amber-600" />
+                      <h4 className="text-base font-semibold tracking-tight">
+                        ประเด็นที่ควรปรับปรุง
+                      </h4>
                     </div>
-                    <ul className="space-y-2 text-sm text-slate-700">
-                      {summary.suggestion
-                        .split(/\n/)
-                        .flatMap((line) =>
-                          line
-                            .split(/(?<=\s)(?=นอกจากนี้|รวมถึง|ควร|และควร|อีกทั้ง|พร้อมทั้ง)|[.。]\s*/)
-                            .map((s) => s.replace(/^[-•–]\s*/, "").trim())
-                            .filter((s) => s.length > 0)
-                        )
-                        .map((item, i) => (
-                          <li key={i} className="flex gap-2 leading-relaxed">
-                            <span className="text-emerald-500 font-bold">•</span>
-                            <span>{item}</span>
-                          </li>
-                        ))}
-                    </ul>
+                    <div className="space-y-3">
+                      {summary.issues.map((issue, idx) => (
+                        <Alert
+                          key={idx}
+                          className={`relative overflow-hidden ${issue.severity === "critical"
+                            ? "border-destructive/60 bg-destructive/10"
+                            : issue.severity === "warning"
+                              ? "border-amber-500/60 bg-amber-500/10"
+                              : "border-blue-500/60 bg-blue-500/10"
+                            }`}
+                        >
+                          <Badge
+                            variant={issue.severity === "critical" ? "destructive" : "outline"}
+                            className={`absolute right-3 top-3 ${issue.severity === "warning"
+                              ? "bg-amber-100 text-amber-700 hover:bg-amber-100 border-amber-200"
+                              : issue.severity === "critical"
+                                ? ""
+                                : "bg-blue-100 text-blue-700 hover:bg-blue-100 border-blue-200"
+                              }`}
+                          >
+                            {issue.mentions} รีวิว
+                          </Badge>
+                          <AlertCircle
+                            className={`h-5 w-5 ${issue.severity === "critical"
+                              ? "text-destructive"
+                              : issue.severity === "warning"
+                                ? "text-amber-500"
+                                : "text-blue-500"
+                              }`}
+                          />
+                          <AlertDescription className="pt-1">
+                            <div className="pr-20">
+                              <h4 className="mb-1 font-semibold text-foreground">
+                                {issue.title}
+                              </h4>
+                              <p className="text-sm text-muted-foreground leading-relaxed">
+                                {issue.description}
+                              </p>
+                            </div>
+                          </AlertDescription>
+                        </Alert>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {suggestionItems.length > 0 && (
+                  <div className="rounded-xl border border-emerald-500/25 bg-gradient-to-b from-emerald-50/40 to-white p-5 sm:p-6">
+                    <div className="mb-4 flex items-center gap-2">
+                      <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-600 text-white shadow-sm">
+                        <Sparkles className="h-4 w-4" />
+                      </div>
+                      <div>
+                        <h5 className="font-semibold text-emerald-950">
+                          คำแนะนำเพื่อการพัฒนา
+                        </h5>
+                        <p className="text-xs text-emerald-800/70">
+                          แนวปฏิบัติที่ปรับใช้กับทีมงานได้ทันที
+                        </p>
+                      </div>
+                    </div>
+                    <ol className="space-y-0 divide-y divide-emerald-100 rounded-lg border border-emerald-100/80 bg-white/80">
+                      {suggestionItems.map((item, i) => (
+                        <li
+                          key={i}
+                          className="flex gap-3 px-3 py-3 text-sm text-slate-800 first:rounded-t-lg last:rounded-b-lg sm:gap-4 sm:px-4"
+                        >
+                          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-xs font-bold text-white shadow-sm">
+                            {i + 1}
+                          </span>
+                          <span className="min-w-0 flex-1 pt-0.5 leading-relaxed">{item}</span>
+                        </li>
+                      ))}
+                    </ol>
                   </div>
                 )}
               </div>
+                )
+              })()
             )}
           </CardContent>
         </Card>
 
         <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
-          <Card className="lg:col-span-2">
-            <CardHeader className="border-b">
-              <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <CardTitle className="text-lg font-semibold">รายชื่อทริปและรีวิว</CardTitle>
-                  <CardDescription>จัดการและดูรายละเอียดผลตอบรับรายทริป</CardDescription>
+          <Card className="lg:col-span-2 overflow-hidden">
+            <CardHeader className="border-b bg-muted/10 pb-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between py-6">
+                <div className="space-y-1">
+                  <CardTitle className="text-lg font-semibold">ทริปที่มีเสียงตอบรับสูง</CardTitle>
+                  <CardDescription>
+                    แสดงทริปที่มีคนให้คะแนนมากที่สุดก่อน — กดแถวเพื่ออ่านรีวิว
+                    {sortedTrips.length > TRIP_LIST_PREVIEW_LIMIT && !tripListExpanded
+                      ? ` (ย่อ ${TRIP_LIST_PREVIEW_LIMIT} ทริปแรก)`
+                      : null}
+                  </CardDescription>
                 </div>
-                <div className="flex items-center gap-2">
-                  <Badge variant="secondary" className="rounded-md">{trips.length} ทริป</Badge>
-                  <Badge variant="outline" className="rounded-md">{visibleReviewsCount} รีวิว</Badge>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <Badge variant="secondary" className="rounded-md font-normal">
+                    {filteredTrips.length} ทริปที่ตรงตัวกรอง
+                  </Badge>
+                  <Badge variant="outline" className="rounded-md font-normal">
+                    {visibleReviewsCount} รีวิว
+                  </Badge>
                 </div>
               </div>
             </CardHeader>
             <CardContent className="p-0">
-              <div className="p-4 bg-muted/20 border-b">
-                <div className="flex flex-col gap-3 md:flex-row md:items-center">
-                  <div className="relative flex-1">
-                    <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <div className="border-b bg-background px-4 py-3">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+                  <div className="relative flex-1 min-w-0">
+                    <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground pointer-events-none" />
                     <Input
                       value={searchTerm}
                       onChange={(event) => setSearchTerm(event.target.value)}
-                      placeholder="หาชื่อทริป, ปลายทาง, หรือเนื้อหารีวิว..."
+                      placeholder="ค้นหาทริป ปลายทาง หรือข้อความในรีวิว..."
                       className="pl-9 bg-white"
                     />
                   </div>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2">
                     <Select value={categoryFilter} onValueChange={setCategoryFilter}>
-                      <SelectTrigger className="w-[140px] bg-white">
+                      <SelectTrigger className="w-full min-w-[132px] sm:w-[150px] bg-white">
                         <SelectValue placeholder="หมวดหมู่" />
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="all">ทั้งหมด</SelectItem>
-                        {categoryOptions.map(opt => <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>)}
+                        {categoryOptions.map((opt) => (
+                          <SelectItem key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </SelectItem>
+                        ))}
                       </SelectContent>
                     </Select>
                     <Select value={sortBy} onValueChange={(v) => setSortBy(v as TripSortOption)}>
-                      <SelectTrigger className="w-[160px] bg-white">
+                      <SelectTrigger className="w-full min-w-[200px] sm:w-[220px] bg-white">
                         <SelectValue placeholder="เรียงลำดับ" />
                       </SelectTrigger>
                       <SelectContent>
-                        {TRIP_SORT_OPTIONS.map(opt => <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>)}
+                        {TRIP_SORT_OPTIONS.map((opt) => (
+                          <SelectItem key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </SelectItem>
+                        ))}
                       </SelectContent>
                     </Select>
                   </div>
                 </div>
               </div>
 
-              <div className="p-0">
-                 <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as TripTab)}>
-                  <div className="px-4 pt-2 border-b">
-                    <TabsList className="bg-transparent gap-4">
-                      <TabsTrigger value="all" className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none px-2 pb-2">มุมมองทั้งหมด</TabsTrigger>
-                      <TabsTrigger value="grouped" className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none px-2 pb-2">กลุ่มตามทริป</TabsTrigger>
-                    </TabsList>
-                  </div>
-                  
-                  <TabsContent value="all" className="m-0">
-                     <Table>
-                        <TableHeader className="bg-muted/30">
-                          <TableRow>
-                            <TableHead className="w-[280px]">ทริป</TableHead>
-                            <TableHead className="text-center">คะแนน</TableHead>
-                            <TableHead className="text-center">ผู้เดินทาง</TableHead>
-                            <TableHead className="text-right">รีวิวล่าสุด</TableHead>
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {sortedTrips.map(trip => (
-                            <TableRow key={trip.id} className="cursor-pointer hover:bg-muted/10">
-                              <TableCell>
-                                <div className="flex items-center gap-3">
-                                  <div className="h-10 w-14 overflow-hidden rounded-md border min-w-[56px]">
-                                    <img src={trip.image} className="h-full w-full object-cover" alt="" />
-                                  </div>
-                                  <div className="min-w-0">
-                                    <p className="font-medium truncate text-sm" title={trip.name}>{trip.name}</p>
-                                    <div className="flex items-center gap-1 text-[10px] text-muted-foreground uppercase tracking-wider">
-                                       <MapPin className="h-3 w-3" />
-                                       {trip.destination}
+              <div className="p-4">
+                {sortedTrips.length === 0 ? (
+                  <EmptyReviewsState message="ไม่พบทริปที่ตรงกับการค้นหาหรือตัวกรอง" />
+                ) : (
+                  <Accordion type="multiple" className="w-full space-y-2">
+                    {displayedTrips.map((trip) => (
+                      <AccordionItem
+                        key={trip.id}
+                        value={trip.id}
+                        className="border rounded-lg overflow-hidden px-0 bg-card shadow-sm"
+                      >
+                        <AccordionTrigger className="hover:no-underline hover:bg-muted/30 px-3 py-3 sm:px-4 [&[data-state=open]]:bg-muted/20">
+                          <div className="flex flex-1 flex-col gap-3 text-left sm:flex-row sm:items-center sm:gap-4 min-w-0 pr-2">
+                            <div className="flex items-center gap-3 min-w-0 flex-1">
+                              <div className="h-11 w-[4.5rem] shrink-0 overflow-hidden rounded-md border bg-muted">
+                                <img
+                                  src={trip.image}
+                                  className="h-full w-full object-cover"
+                                  alt=""
+                                />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="font-medium text-sm leading-snug line-clamp-2" title={trip.name}>
+                                  {trip.name}
+                                </p>
+                                <p className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
+                                  <MapPin className="h-3 w-3 shrink-0" />
+                                  <span className="truncate">{trip.destination}</span>
+                                </p>
+                              </div>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:justify-end sm:shrink-0">
+                              <span
+                                className="inline-flex items-center gap-1 tabular-nums rounded-md border bg-background px-2 py-0.5 font-semibold text-primary"
+                                title="คะแนนบริการเฉลี่ย"
+                              >
+                                <ThumbsUp className="h-3.5 w-3.5" />
+                                {formatReviewScore(trip.serviceRating)}
+                              </span>
+                              <span className="text-muted-foreground tabular-nums">
+                                <Users className="inline h-3 w-3 mr-0.5 -translate-y-px" />
+                                {trip.totalTripTravelers} เดินทาง
+                              </span>
+                              <Badge variant="secondary" className="font-normal tabular-nums">
+                                {trip.reviewersCount} คนรีวิว
+                              </Badge>
+                              <span className="text-muted-foreground tabular-nums hidden sm:inline">
+                                {trip.reviewsCount} ข้อความ
+                              </span>
+                            </div>
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="bg-muted/20 border-t">
+                          <div className="p-3 sm:p-4 space-y-3">
+                            {trip.reviews.map((review) => (
+                              <div
+                                key={review.id}
+                                className="relative rounded-lg border bg-background p-3 shadow-sm group"
+                              >
+                                <div className="flex justify-between items-start gap-2 mb-2">
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <div className="h-8 w-8 shrink-0 rounded-full bg-muted flex items-center justify-center text-xs font-semibold text-muted-foreground border">
+                                      {getReviewAuthor(review).charAt(0)}
+                                    </div>
+                                    <div className="min-w-0">
+                                      <p className="text-sm font-semibold truncate">
+                                        {getReviewAuthor(review)}
+                                      </p>
+                                      <p className="text-[10px] text-muted-foreground">
+                                        {formatThaiDateTime(review.created_at)}
+                                      </p>
                                     </div>
                                   </div>
+                                  <div className="flex items-start gap-1 shrink-0">
+                                    <div className="flex items-center gap-1 tabular-nums text-right">
+                                      <span className="text-[10px] text-muted-foreground font-normal">
+                                        บริการ
+                                      </span>
+                                      <ThumbsUp className="h-3.5 w-3.5 text-primary" />
+                                      <span className="text-xs font-bold text-primary">
+                                        {formatReviewScore(review.service_rating)}
+                                      </span>
+                                    </div>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
+                                      onClick={(e) => {
+                                        e.preventDefault()
+                                        setDeleteTarget({
+                                          reviewId: review.id,
+                                          name: getReviewAuthor(review),
+                                        })
+                                      }}
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </Button>
+                                  </div>
                                 </div>
-                              </TableCell>
-                              <TableCell className="text-center">
-                                <div className="flex flex-col items-center">
-                                  <span className="font-bold text-sm">{trip.rating.toFixed(1)}</span>
-                                  <ReviewStars value={trip.rating} iconClassName="h-2.5 w-2.5 text-amber-400 fill-amber-400" />
-                                </div>
-                              </TableCell>
-                              <TableCell className="text-center text-xs text-muted-foreground">
-                                <p className="font-medium text-slate-700">{trip.totalTripTravelers}</p>
-                                คน
-                              </TableCell>
-                              <TableCell className="text-right text-xs whitespace-nowrap">
-                                {formatThaiDate(trip.lastReviewAt)}
-                              </TableCell>
-                            </TableRow>
-                          ))}
-                        </TableBody>
-                     </Table>
-                  </TabsContent>
+                                <p className="text-sm text-foreground/90 leading-relaxed pl-10 border-l-2 border-primary/25 ml-1 py-0.5">
+                                  {review.comment || (
+                                    <span className="italic text-muted-foreground">ไม่มีข้อเสนอแนะ</span>
+                                  )}
+                                </p>
+                              </div>
+                            ))}
+                          </div>
+                        </AccordionContent>
+                      </AccordionItem>
+                    ))}
+                  </Accordion>
+                )}
 
-                  <TabsContent value="grouped" className="m-0 p-4">
-                    <Accordion type="multiple" className="w-full space-y-3">
-                       {sortedTrips.map(trip => (
-                        <AccordionItem key={trip.id} value={trip.id} className="border rounded-xl overflow-hidden px-0">
-                          <AccordionTrigger className="hover:no-underline px-4 py-3 bg-white">
-                             <div className="flex flex-1 items-center gap-4 text-left">
-                                <div className="h-12 w-16 overflow-hidden rounded-lg border">
-                                  <img src={trip.image} className="h-full w-full object-cover" alt="" />
-                                </div>
-                                <div className="flex-1">
-                                  <h4 className="font-semibold text-sm leading-tight mb-1">{trip.name}</h4>
-                                  <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                                    <span className="flex items-center gap-1"><Star className="h-3 w-3 fill-amber-400 text-amber-400" /> {trip.rating.toFixed(1)}</span>
-                                    <span className="flex items-center gap-1"><Users className="h-3 w-3" /> {trip.totalTripTravelers} คนเดินทาง</span>
-                                    <span className="flex items-center gap-1 font-medium text-primary bg-primary/5 px-1.5 py-0.5 rounded">{trip.reviewsCount} รีวิว</span>
-                                  </div>
-                                </div>
-                             </div>
-                          </AccordionTrigger>
-                          <AccordionContent className="bg-muted/10 border-t">
-                             <div className="p-4 space-y-4">
-                                {trip.reviews.map(review => (
-                                  <div key={review.id} className="relative bg-white p-3 rounded-lg border shadow-sm group">
-                                     <div className="flex justify-between items-start mb-2">
-                                        <div className="flex items-center gap-2">
-                                          <div className="h-8 w-8 rounded-full bg-slate-100 flex items-center justify-center text-xs font-bold text-slate-500 border">
-                                            {getReviewAuthor(review).charAt(0)}
-                                          </div>
-                                          <div>
-                                            <p className="text-sm font-semibold">{getReviewAuthor(review)}</p>
-                                            <p className="text-[10px] text-muted-foreground">{formatThaiDateTime(review.created_at)}</p>
-                                          </div>
-                                        </div>
-                                        <div className="flex items-center gap-1">
-                                          <Star className="h-3 w-3 fill-amber-400 text-amber-400" />
-                                          <span className="text-xs font-bold text-amber-600">{review.trip_rating}</span>
-                                          <Button 
-                                            variant="ghost" 
-                                            size="sm" 
-                                            className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-all ml-1"
-                                            onClick={(e) => {
-                                              e.preventDefault();
-                                              setDeleteTarget({ reviewId: review.id, name: getReviewAuthor(review) });
-                                            }}
-                                          >
-                                            <Trash2 className="h-3.5 w-3.5" />
-                                          </Button>
-                                        </div>
-                                     </div>
-                                     <p className="text-sm text-slate-700 leading-relaxed pl-10 border-l-2 border-primary/20 ml-4 py-1">
-                                       {review.comment || <span className="italic text-slate-400">ไม่มีข้อเสนอแนะ</span>}
-                                     </p>
-                                  </div>
-                                ))}
-                             </div>
-                          </AccordionContent>
-                        </AccordionItem>
-                       ))}
-                    </Accordion>
-                  </TabsContent>
-                 </Tabs>
+                {sortedTrips.length > TRIP_LIST_PREVIEW_LIMIT && (
+                  <div className="mt-4 flex justify-center border-t pt-4">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="rounded-full"
+                      onClick={() => setTripListExpanded((prev) => !prev)}
+                    >
+                      {tripListExpanded
+                        ? `แสดงน้อยลง (${TRIP_LIST_PREVIEW_LIMIT} ทริป)`
+                        : `แสดงทั้งหมดอีก ${sortedTrips.length - TRIP_LIST_PREVIEW_LIMIT} ทริป`}
+                    </Button>
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>
 
-          <Card className="self-start">
+          <Card className="self-start py-6">
             <CardHeader>
               <CardTitle className="text-lg font-semibold">สรุปสัดส่วนคะแนน</CardTitle>
               <CardDescription>ภาพรวมความพึงพอใจแยกตามระดับดาว</CardDescription>
             </CardHeader>
             <CardContent>
               <div className="space-y-5">
-                {ratingsStats.map((rating) => (
+                {(summary?.ratings_stats || ratingsStats).map((rating) => (
                   <div key={rating.stars} className="space-y-1.5">
                     <div className="flex items-center justify-between text-xs">
                       <div className="flex items-center gap-1 font-medium">
@@ -905,14 +993,14 @@ export default function AIInsightDashboard() {
                 ))}
               </div>
               
-              <div className="mt-8 p-4 rounded-xl border border-primary/20 bg-primary/5">
+              <div className="mt-8 p-4 rounded-xl border border-primary/20 bg-primary/5 py-6">
                  <h5 className="text-sm font-semibold mb-2 flex items-center gap-2">
                     <TrendingUp className="h-4 w-4 text-primary" />
                     Insight วันนี้
                  </h5>
                  <p className="text-xs text-slate-600 leading-relaxed">
-                    จากการวิเคราะห์ {totalReviews} รีวิวล่าสุด พบว่าค่าเฉลี่ยความพึงพอใจโดยรวมอยู่ที่ {averageRating.toFixed(2)}/5.00 คะแนน 
-                    {averageRating >= 4 ? " ซึ่งอยู่ในเกณฑ์ดีเยี่ยม" : " ทีมงานควรเร่งตรวจสอบจุดที่ต้องปรับปรุงเพื่อรักษามาตรฐานการบริการ"}
+                    จากการวิเคราะห์ {summary?.total_reviews || totalReviews} รีวิวล่าสุด พบว่าค่าเฉลี่ยความพึงพอใจโดยรวมอยู่ที่ {(summary?.average_rating || averageRating).toFixed(2)}/5.00 คะแนน 
+                    {(summary?.average_rating || averageRating) >= 4 ? " ซึ่งอยู่ในเกณฑ์ดีเยี่ยม" : " ทีมงานควรเร่งตรวจสอบจุดที่ต้องปรับปรุงเพื่อรักษามาตรฐานการบริการ"}
                  </p>
               </div>
             </CardContent>
